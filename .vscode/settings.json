@@ -1,0 +1,4 @@
+{
+    "python.defaultInterpreterPath": "/usr/bin/python3.10",
+    "python-envs.defaultEnvManager": "ms-python.python:system"
+}
