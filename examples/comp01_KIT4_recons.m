@@ -51,7 +51,7 @@ end
 %printing results
 if(printFlag)
     figure(2)
-    eval(['print -djpeg KIT4_recons/phantom_' num2str(ex) '_' num2str(ver) '.jpeg'])
+    eval(['print -djpeg examples/phantom_' num2str(ex) '_' num2str(ver) '.jpeg'])
 end
 
 

@@ -214,7 +214,7 @@ def plot_reconstruction(p: np.ndarray, recon: np.ndarray, data_dir: Path):
     fig = plt.figure(2, clear=True)
     ax = fig.add_subplot(111)
     triang = mtri.Triangulation(p[0, :], p[1, :], triangles)
-    ax.tripcolor(triang, recon, shading="gouraud", cmap="jet")
+    ax.tripcolor(triang, recon, cmap="jet")
     ax.set_aspect("equal")
     ax.axis("off")
     return fig, ax
