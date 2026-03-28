@@ -40,5 +40,30 @@ class TestForwardSolver(parameterized.TestCase):
         u = eq.solve(sigma, f=None, bc=bc)
         torch.testing.assert_close(u[1:-1, 1:-1], expected, atol=1e-12, rtol=1e-5)
 
+    @parameterized.named_parameters(
+        ('square_node',         'node',       16,       1.0),
+        ('square_staggered',    'staggered',  16,       1.0),
+        ('nonsquare_node',      'node',       (20, 10), (2.0, 1.0)),
+        ('nonsquare_staggered', 'staggered',  (20, 10), (2.0, 1.0)),
+    )
+    def test_forward_laplacian(self, grid_type, grid_size, domain_size):
+        r"""For :math:`\sigma = 1` and :math:`u = x^2 + y^2`,
+        :meth:`forward` should return :math:`-\nabla \cdot (\sigma \nabla u) = -4`
+        at every interior node, for both grid types and non-square grids.
+        """
+        eq = DiffusionEquation2D(
+            grid_size=grid_size, domain_size=domain_size, grid_type=grid_type,
+        )
+        if grid_type == 'node':
+            sigma = torch.ones((eq.Nx, eq.Ny), dtype=torch.float64)
+        else:
+            sigma = torch.ones((eq.Nx - 1, eq.Ny - 1), dtype=torch.float64)
+
+        u = eq.x_nodes ** 2 + eq.y_nodes ** 2
+        result = eq.forward(sigma, u)
+        expected = torch.full((eq.Nx_int, eq.Ny_int), -4.0, dtype=torch.float64)
+        torch.testing.assert_close(result[1:-1, 1:-1], expected, atol=1e-10, rtol=0.0)
+
+
 if __name__ == '__main__':
     absltest.main()

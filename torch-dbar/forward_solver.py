@@ -11,7 +11,7 @@ class DiffusionEquation2D(nn.Module):
         self,
         grid_size: Union[int, Tuple[int, int]],
         domain_size: Union[float, Tuple[float, float]] = 1.0,
-        grid_type: str = "staggered",
+        grid_type: str = "staggered", # "node" or "staggered"
         dtype: torch.dtype = torch.float64,
         device: torch.device | None = None,
     ):
@@ -98,29 +98,27 @@ class DiffusionEquation2D(nn.Module):
         cols.append(torch.arange(self.M, device=self.device))
         data.append(diag_data)
         
-        # East
-        data_e = -k_e[:, :-1].ravel()
-        rows.append(idx_grid_int[:, :-1].ravel())
-        cols.append(idx_grid_int[:, 1:].ravel())
-        data.append(data_e)
-        
-        # West
-        data_w = -k_e[:, :-1].ravel()
-        rows.append(idx_grid_int[:, 1:].ravel())
-        cols.append(idx_grid_int[:, :-1].ravel())
-        data.append(data_w)
-        
-        # North
-        data_n = -k_n[:-1, :].ravel()
+        # East/West: coupling along the x-axis (first grid dimension).
+        # The face between interior nodes (i,j) and (i+1,j) carries conductivity k_e[i,j].
+        data_e = -k_e[:-1, :].ravel()
         rows.append(idx_grid_int[:-1, :].ravel())
         cols.append(idx_grid_int[1:, :].ravel())
-        data.append(data_n)
-        
-        # South
-        data_s = -k_n[:-1, :].ravel()
+        data.append(data_e)
+        # Symmetric (west) entry
         rows.append(idx_grid_int[1:, :].ravel())
         cols.append(idx_grid_int[:-1, :].ravel())
-        data.append(data_s)
+        data.append(data_e)
+
+        # North/South: coupling along the y-axis (second grid dimension).
+        # The face between interior nodes (i,j) and (i,j+1) carries conductivity k_n[i,j].
+        data_n = -k_n[:, :-1].ravel()
+        rows.append(idx_grid_int[:, :-1].ravel())
+        cols.append(idx_grid_int[:, 1:].ravel())
+        data.append(data_n)
+        # Symmetric (south) entry
+        rows.append(idx_grid_int[:, 1:].ravel())
+        cols.append(idx_grid_int[:, :-1].ravel())
+        data.append(data_n)
 
         rows = torch.cat(rows)
         cols = torch.cat(cols)
@@ -185,8 +183,126 @@ class DiffusionEquation2D(nn.Module):
         u[1:-1, 1:-1] = u_int.reshape(self.Nx_int, self.Ny_int)
         return u
         
-    def forward(self, sigma, u):
-        pass
+    def get_flux(
+        self, sigma: torch.Tensor, u: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""Compute the flux field :math:`\mathbf{F} = -\sigma \nabla u` on staggered face grids.
+
+        The two components are sampled on staggered faces between consecutive
+        nodes:
+
+        * :math:`F_x` — at x-faces, shape ``(Nx\_int+1, Ny\_int)``
+        * :math:`F_y` — at y-faces, shape ``(Nx\_int, Ny\_int+1)``
+
+        where ``Nx_int = Nx - 2`` and ``Ny_int = Ny - 2`` are the counts of
+        interior nodes in each direction.
+
+        .. note::
+            The leading minus sign is included so that
+            ``self.get_div(self.get_flux(sigma, u))`` reproduces
+            :meth:`forward`, i.e. it equals :math:`-\nabla \cdot (\sigma \nabla u)`.
+
+        Parameters
+        ----------
+        sigma : torch.Tensor
+            Conductivity field.  Shape ``(Nx, Ny)`` for ``grid_type="node"``
+            or ``(Nx-1, Ny-1)`` for ``grid_type="staggered"``.
+        u : torch.Tensor
+            Full nodal solution, shape ``(Nx, Ny)``, including boundary values.
+
+        Returns
+        -------
+        Fx : torch.Tensor
+            x-component of :math:`-\sigma \nabla u`, shape ``(Nx\_int+1, Ny\_int)``.
+        Fy : torch.Tensor
+            y-component of :math:`-\sigma \nabla u`, shape ``(Nx\_int, Ny\_int+1)``.
+        """
+        k_e, k_w, k_n, k_s = self._get_face_coefs(sigma)
+        # All four arrays have shape (Nx_int, Ny_int).
+
+        # --- x-faces --------------------------------------------------------
+        # Nx_int+1 faces per y-interior column.
+        # Face 0      : west boundary face of the first interior column
+        #               → conductivity k_w[0, :]
+        # Faces 1..Nx_int : east face of each interior column (ends at the right
+        #               boundary face) → conductivity k_e[0:, :]
+        sigma_fx = torch.cat([k_w[0:1, :], k_e], dim=0)          # (Nx_int+1, Ny_int)
+        # \partial u / \partial x at each x-face (forward difference).
+        # u[0:Nx_int+1, 1:-1]  — left  node of each face, shape (Nx_int+1, Ny_int)
+        # u[1:Nx_int+2, 1:-1]  — right node of each face, shape (Nx_int+1, Ny_int)
+        grad_x = (u[1:self.Nx_int + 2, 1:-1] - u[0:self.Nx_int + 1, 1:-1]) / self.hx
+        Fx = -sigma_fx * grad_x
+
+        # --- y-faces --------------------------------------------------------
+        # Ny_int+1 faces per x-interior row.
+        # Face 0      : south boundary face of the first interior row
+        #               → conductivity k_s[:, 0]
+        # Faces 1..Ny_int : north face of each interior row (ends at the top
+        #               boundary face) → conductivity k_n[:, 0:]
+        sigma_fy = torch.cat([k_s[:, 0:1], k_n], dim=1)           # (Nx_int, Ny_int+1)
+        grad_y = (u[1:-1, 1:self.Ny_int + 2] - u[1:-1, 0:self.Ny_int + 1]) / self.hy
+        Fy = -sigma_fy * grad_y
+
+        return Fx, Fy
+
+    def get_div(self, flux: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        r"""Compute :math:`\nabla \cdot \mathbf{F}` at every interior node.
+
+        The flux tuple is expected on the staggered face grids produced by
+        :meth:`get_flux`:
+
+        * ``Fx`` — shape ``(Nx\_int+1, Ny\_int)``
+        * ``Fy`` — shape ``(Nx\_int, Ny\_int+1)``
+
+        The divergence is approximated by first-order finite differences across
+        adjacent faces:
+
+        .. math::
+
+            (\nabla \cdot \mathbf{F})_{i,j}
+            \approx \frac{F_x^{i+1,j} - F_x^{i,j}}{h_x}
+                  + \frac{F_y^{i,j+1} - F_y^{i,j}}{h_y}
+
+        Parameters
+        ----------
+        flux : tuple of two torch.Tensor
+            ``(Fx, Fy)`` as returned by :meth:`get_flux`.
+
+        Returns
+        -------
+        result : torch.Tensor
+            Full ``(Nx, Ny)`` tensor; interior entries hold
+            :math:`\nabla \cdot \mathbf{F}`, boundary entries are zero.
+        """
+        Fx, Fy = flux
+        div_x = (Fx[1:, :] - Fx[:-1, :]) / self.hx   # (Nx_int, Ny_int)
+        div_y = (Fy[:, 1:] - Fy[:, :-1]) / self.hy   # (Nx_int, Ny_int)
+        result = torch.zeros((self.Nx, self.Ny), dtype=Fx.dtype, device=Fx.device)
+        result[1:-1, 1:-1] = div_x + div_y
+        return result
+
+    def forward(self, sigma: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        r"""Apply the diffusion operator :math:`-\nabla \cdot (\sigma \nabla u)` at every interior node.
+
+        Implemented as :math:`\nabla \cdot \mathbf{F}` where
+        :math:`\mathbf{F} = -\sigma \nabla u` is computed by :meth:`get_flux`
+        and the divergence is taken by :meth:`get_div`.
+
+        Parameters
+        ----------
+        sigma : torch.Tensor
+            Conductivity field.  Shape ``(Nx, Ny)`` for ``grid_type="node"``
+            or ``(Nx-1, Ny-1)`` for ``grid_type="staggered"``.
+        u : torch.Tensor
+            Full nodal solution, shape ``(Nx, Ny)``, including boundary values.
+
+        Returns
+        -------
+        result : torch.Tensor
+            ``(Nx, Ny)`` tensor; interior entries hold
+            :math:`-\nabla \cdot (\sigma \nabla u)`, boundary entries are zero.
+        """
+        return self.get_div(self.get_flux(sigma, u))
 
     def dirichlet_to_neumann(self, sigma):
         pass
