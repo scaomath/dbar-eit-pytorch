@@ -210,3 +210,4 @@ __marimo__
 KIT4_measdata/*.mat
 data/*.mat
 examples/*.jpeg
+examples/eda_outputs/*
