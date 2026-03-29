@@ -31,6 +31,7 @@ import warnings
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 __all__ = [
     "make_square_trig_mode_indices",
@@ -480,50 +481,135 @@ def _as_batch_scattering_grid(
 
 
 def _rect_grid_coords(
-    K1: np.ndarray,
-    K2: np.ndarray,
-    values: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    x_coords = np.asarray(K1[0, :], dtype=np.float64)
-    y_coords = np.asarray(K2[:, 0], dtype=np.float64)
-    vals = np.asarray(values)
+    K1: torch.Tensor,
+    K2: torch.Tensor,
+    values: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    K1 = torch.as_tensor(K1)
+    K2 = torch.as_tensor(K2, device=K1.device)
+    vals = torch.as_tensor(values, device=K1.device)
+    x_coords = K1[0, :].to(dtype=torch.float64)
+    y_coords = K2[:, 0].to(dtype=torch.float64)
     if x_coords[0] > x_coords[-1]:
-        x_coords = x_coords[::-1]
-        vals = vals[:, ::-1]
+        x_coords = torch.flip(x_coords, dims=(0,))
+        vals = torch.flip(vals, dims=(1,))
     if y_coords[0] > y_coords[-1]:
-        y_coords = y_coords[::-1]
-        vals = vals[::-1, :]
+        y_coords = torch.flip(y_coords, dims=(0,))
+        vals = torch.flip(vals, dims=(0,))
     return x_coords, y_coords, vals
 
 
 def _interp2_bicubic_rect_grid(
-    K1: np.ndarray,
-    K2: np.ndarray,
-    values: np.ndarray,
-    x_query: np.ndarray,
-    y_query: np.ndarray,
-) -> np.ndarray:
-    from scipy.interpolate import RectBivariateSpline
-
+    K1: torch.Tensor,
+    K2: torch.Tensor,
+    values: torch.Tensor,
+    x_query: torch.Tensor,
+    y_query: torch.Tensor,
+) -> torch.Tensor:
     x_coords, y_coords, values = _rect_grid_coords(K1, K2, values)
-    spline_re = RectBivariateSpline(y_coords, x_coords, np.real(values), kx=3, ky=3)
-    spline_im = RectBivariateSpline(y_coords, x_coords, np.imag(values), kx=3, ky=3)
-    return spline_re.ev(y_query, x_query) + 1j * spline_im.ev(y_query, x_query)
+    values = values.to(device=x_coords.device)
+    complex_dtype = values.dtype if torch.is_complex(values) else _complex_dtype_from(values.dtype)
+    values = values.to(dtype=complex_dtype)
+    x_query = torch.as_tensor(x_query, device=x_coords.device, dtype=x_coords.dtype)
+    y_query = torch.as_tensor(y_query, device=x_coords.device, dtype=y_coords.dtype)
+
+    if x_coords.numel() < 2 or y_coords.numel() < 2:
+        raise ValueError("Rectangular-grid interpolation requires at least two samples per axis.")
+
+    def _normalize(query: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
+        if coords.numel() == 1:
+            return torch.zeros_like(query)
+        span = coords[-1] - coords[0]
+        if torch.abs(span) < torch.finfo(coords.dtype).eps:
+            return torch.zeros_like(query)
+        return 2.0 * (query - coords[0]) / span - 1.0
+
+    grid_x = _normalize(x_query, x_coords)
+    grid_y = _normalize(y_query, y_coords)
+    sample_grid = torch.stack((grid_x, grid_y), dim=-1).view(1, 1, -1, 2)
+    image = torch.stack((values.real, values.imag), dim=0).unsqueeze(0).to(dtype=x_coords.dtype)
+    sampled = F.grid_sample(
+        image,
+        sample_grid,
+        mode="bicubic",
+        padding_mode="zeros",
+        align_corners=True,
+    )
+    sampled = sampled.view(2, -1)
+    return torch.complex(sampled[0], sampled[1]).to(dtype=complex_dtype)
 
 
 def _interp_cubic_scattered(
-    Kvec: np.ndarray,
-    values: np.ndarray,
-    x_query: np.ndarray,
-    y_query: np.ndarray,
-) -> np.ndarray:
-    from scipy.interpolate import griddata
+    Kvec: torch.Tensor,
+    values: torch.Tensor,
+    x_query: torch.Tensor,
+    y_query: torch.Tensor,
+    *,
+    chunk_size: int = 4096,
+) -> torch.Tensor:
+    Kvec = torch.as_tensor(Kvec)
+    device = Kvec.device
+    sample_points = torch.stack(
+        (
+            torch.imag(Kvec.reshape(-1)).to(dtype=torch.float64),
+            torch.real(Kvec.reshape(-1)).to(dtype=torch.float64),
+        ),
+        dim=-1,
+    )
+    values = torch.as_tensor(values, device=device).reshape(-1)
+    complex_dtype = values.dtype if torch.is_complex(values) else _complex_dtype_from(values.dtype)
+    values = values.to(dtype=complex_dtype)
+    query_points = torch.stack(
+        (
+            torch.as_tensor(y_query, device=device, dtype=torch.float64).reshape(-1),
+            torch.as_tensor(x_query, device=device, dtype=torch.float64).reshape(-1),
+        ),
+        dim=-1,
+    )
 
-    points = np.column_stack((np.imag(Kvec.reshape(-1)), np.real(Kvec.reshape(-1))))
-    values = values.reshape(-1)
-    real_part = griddata(points, np.real(values), (y_query, x_query), method="cubic", fill_value=0.0)
-    imag_part = griddata(points, np.imag(values), (y_query, x_query), method="cubic", fill_value=0.0)
-    return real_part + 1j * imag_part
+    if sample_points.shape[0] != values.numel():
+        raise ValueError(
+            f"Scattered interpolation expects the same number of points and values, got {sample_points.shape[0]} and {values.numel()}."
+        )
+
+    if sample_points.shape[0] == 0:
+        return torch.zeros(query_points.shape[0], device=device, dtype=complex_dtype)
+
+    sample_extent = sample_points.max(dim=0).values - sample_points.min(dim=0).values
+    diagonal = torch.linalg.vector_norm(sample_extent)
+    bandwidth = diagonal / max(math.sqrt(float(sample_points.shape[0])), 1.0)
+    bandwidth = torch.clamp(bandwidth, min=1e-6)
+    inside_bbox = (
+        (query_points[:, 0] >= sample_points[:, 0].min())
+        & (query_points[:, 0] <= sample_points[:, 0].max())
+        & (query_points[:, 1] >= sample_points[:, 1].min())
+        & (query_points[:, 1] <= sample_points[:, 1].max())
+    )
+
+    output = torch.zeros(query_points.shape[0], device=device, dtype=complex_dtype)
+    values_real = values.real.to(dtype=torch.float64)
+    values_imag = values.imag.to(dtype=torch.float64)
+    log_cutoff = math.log(torch.finfo(torch.float64).tiny)
+    bandwidth_sq = bandwidth.square()
+
+    for start in range(0, query_points.shape[0], chunk_size):
+        stop = min(start + chunk_size, query_points.shape[0])
+        query_chunk = query_points[start:stop]
+        d2 = torch.cdist(query_chunk, sample_points).square()
+        log_weights = -0.5 * d2 / bandwidth_sq
+        weights = torch.exp(torch.clamp(log_weights, min=log_cutoff))
+        denom = weights.sum(dim=1)
+        valid = (denom > 1e-12) & inside_bbox[start:stop]
+        if torch.any(valid):
+            numer_real = weights[valid] @ values_real
+            numer_imag = weights[valid] @ values_imag
+            output_chunk = torch.zeros(stop - start, device=device, dtype=complex_dtype)
+            output_chunk[valid] = torch.complex(numer_real / denom[valid], numer_imag / denom[valid]).to(
+                dtype=complex_dtype
+            )
+            output[start:stop] = output_chunk
+
+    return output
 
 
 def make_trig_basis(
@@ -724,8 +810,15 @@ class DbarReconstruction2D(nn.Module):
             trig_mode_indices = torch.empty(0, dtype=torch.int64)
             lambda_ref = make_reference_dn_map(n_boundary_nodes=n_boundary_nodes, n_modes=n_modes)
 
-        xy = torch.linspace(-1.0, 1.0, image_size)
-        yy, xx = torch.meshgrid(xy, xy, indexing="ij")
+        if self.domain_shape == "square":
+            Lx, Ly = _normalize_square_domain_size(domain_size)
+            x_coords = torch.linspace(0.0, Lx, image_size)
+            y_coords = torch.linspace(0.0, Ly, image_size)
+        else:
+            x_coords = torch.linspace(-1.0, 1.0, image_size)
+            y_coords = x_coords
+
+        yy, xx = torch.meshgrid(y_coords, x_coords, indexing="ij")
         z_grid = xx + 1j * yy
 
         kx = torch.linspace(-self.k_extent, self.k_extent, k_grid_size)
@@ -749,7 +842,7 @@ class DbarReconstruction2D(nn.Module):
     def extra_repr(self) -> str:
         return (
             f"domain_shape={self.domain_shape}, image_size={self.image_size}, n_boundary_nodes={self.n_boundary_nodes}, "
-            f"n_modes={self.n_modes}, k_grid_size={self.k_grid_size}, "
+            f"n_modes={self.n_modes}, domain_size={self.domain_size}, k_grid_size={self.k_grid_size}, "
             f"k_radius={self.k_radius}, k_extent={self.k_extent}"
         )
 
@@ -847,56 +940,56 @@ class DbarReconstruction2D(nn.Module):
         grid_shape = (int(K1.shape[0]), int(K1.shape[1])) if K1 is not None else None
         tBIE, squeeze = _as_batch_scattering_samples(tBIE, "tBIE", grid_shape=grid_shape)
         complex_dtype = _complex_dtype_from(tBIE.dtype)
+        device = self.k_grid.device
         out = torch.zeros(
             (tBIE.shape[0], self.k_grid_size, self.k_grid_size),
-            device=self.k_grid.device,
+            device=device,
             dtype=complex_dtype,
         )
 
-        query_mask = self.k_mask.reshape(-1).detach().cpu().numpy().astype(bool)
-        query_x = self.k_grid.real.reshape(-1)[self.k_mask.reshape(-1)].detach().cpu().numpy()
-        query_y = self.k_grid.imag.reshape(-1)[self.k_mask.reshape(-1)].detach().cpu().numpy()
+        query_mask = self.k_mask.reshape(-1)
+        query_x = self.k_grid.real.reshape(-1)[query_mask].to(device=device)
+        query_y = self.k_grid.imag.reshape(-1)[query_mask].to(device=device)
 
-        K1_np = None if K1 is None else torch.as_tensor(K1).detach().cpu().numpy()
-        K2_np = None if K2 is None else torch.as_tensor(K2).detach().cpu().numpy()
-        Kvec_np = None if Kvec is None else torch.as_tensor(Kvec).detach().cpu().numpy()
+        K1_t = None if K1 is None else torch.as_tensor(K1, device=device)
+        K2_t = None if K2 is None else torch.as_tensor(K2, device=device)
+        Kvec_t = None if Kvec is None else torch.as_tensor(Kvec, device=device)
 
         for b in range(tBIE.shape[0]):
-            sample = tBIE[b].to(dtype=complex_dtype).detach().cpu().numpy()
+            sample = tBIE[b].to(device=device, dtype=complex_dtype)
 
-            if K1_np is not None:
+            if K1_t is not None:
+                assert K2_t is not None
                 if sample.ndim == 1:
                     if t_max is None:
                         raise ValueError("t_max is required when tBIE is provided as vector samples.")
-                    scat_grid = np.zeros_like(K1_np, dtype=sample.dtype)
-                    inside = np.abs(K1_np + 1j * K2_np) < float(t_max)
-                    if sample.size != int(inside.sum()):
+                    scat_grid = torch.zeros_like(K1_t, dtype=complex_dtype)
+                    inside = torch.abs(K1_t.to(dtype=torch.float64) + 1j * K2_t.to(dtype=torch.float64)) < float(t_max)
+                    if sample.numel() != int(inside.sum().item()):
                         raise ValueError(
-                            f"Vector tBIE length {sample.size} does not match the number of |K|<t_max points {int(inside.sum())}."
+                            f"Vector tBIE length {sample.numel()} does not match the number of |K|<t_max points {int(inside.sum().item())}."
                         )
                     scat_grid[inside] = sample.reshape(-1)
                 else:
                     scat_grid = sample
 
                 if cutoff is not None:
-                    scat_grid = scat_grid.copy()
-                    scat_grid[np.abs(np.real(scat_grid)) > cutoff] = 0
-                    scat_grid[np.abs(np.imag(scat_grid)) > cutoff] = 0
+                    scat_grid = scat_grid.clone()
+                    scat_grid[torch.abs(torch.real(scat_grid)) > cutoff] = 0
+                    scat_grid[torch.abs(torch.imag(scat_grid)) > cutoff] = 0
 
-                interp_vals = _interp2_bicubic_rect_grid(K1_np, K2_np, scat_grid, query_x, query_y)
+                interp_vals = _interp2_bicubic_rect_grid(K1_t, K2_t, scat_grid, query_x, query_y)
             else:
+                assert Kvec_t is not None
                 if cutoff is not None:
-                    sample = sample.copy()
-                    sample[np.abs(np.real(sample)) > cutoff] = 0
-                    sample[np.abs(np.imag(sample)) > cutoff] = 0
-                interp_vals = _interp_cubic_scattered(Kvec_np, sample, query_x, query_y)
+                    sample = sample.clone()
+                    sample[torch.abs(torch.real(sample)) > cutoff] = 0
+                    sample[torch.abs(torch.imag(sample)) > cutoff] = 0
+                interp_vals = _interp_cubic_scattered(Kvec_t, sample, query_x, query_y)
 
-            flat = np.zeros(self.k_grid.numel(), dtype=interp_vals.dtype)
+            flat = torch.zeros(self.k_grid.numel(), device=device, dtype=complex_dtype)
             flat[query_mask] = interp_vals
-            out[b] = torch.from_numpy(flat.reshape(self.k_grid_size, self.k_grid_size)).to(
-                device=self.k_grid.device,
-                dtype=complex_dtype,
-            )
+            out[b] = flat.reshape(self.k_grid_size, self.k_grid_size)
 
         return out[0] if squeeze else out
 

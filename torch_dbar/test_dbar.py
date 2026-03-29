@@ -1,5 +1,7 @@
 from dbar import (
     DbarReconstruction2D,
+    _interp2_bicubic_rect_grid,
+    _interp_cubic_scattered,
     arc_length_params_square,
     build_dn_map_from_electrode_data,
     build_nd_map_from_electrode_data,
@@ -130,6 +132,56 @@ class TestDbarCGO(absltest.TestCase):
 
 
 class TestDbarReconstruction(absltest.TestCase):
+    def test_interp2_bicubic_rect_grid_matches_grid_nodes(self):
+        x = torch.linspace(-1.0, 1.0, 9, dtype=torch.float64)
+        y = torch.linspace(-1.5, 1.5, 7, dtype=torch.float64)
+        K2, K1 = torch.meshgrid(y, x, indexing="ij")
+        values = (K1.square() - 0.5 * K2) + 1j * (K1 + K2.square())
+
+        query_x = torch.tensor([x[0], x[3], x[-1], x[5]], dtype=torch.float64)
+        query_y = torch.tensor([y[0], y[2], y[-1], y[4]], dtype=torch.float64)
+        expected = values[torch.tensor([0, 2, 6, 4]), torch.tensor([0, 3, 8, 5])]
+
+        interp_vals = _interp2_bicubic_rect_grid(K1.flip(0).flip(1), K2.flip(0).flip(1), values.flip(0).flip(1), query_x, query_y)
+        torch.testing.assert_close(interp_vals, expected, atol=1e-8, rtol=0.0)
+
+    def test_interp_cubic_scattered_preserves_constant_inside_bbox(self):
+        sample_xy = torch.tensor(
+            [
+                [-1.0, -0.75],
+                [-0.5, 0.5],
+                [0.0, -0.25],
+                [0.25, 0.75],
+                [0.8, -0.6],
+                [1.0, 0.9],
+            ],
+            dtype=torch.float64,
+        )
+        Kvec = sample_xy[:, 1] + 1j * sample_xy[:, 0]
+        values = torch.full((sample_xy.shape[0],), 2.5 - 0.75j, dtype=torch.complex128)
+        query_x = torch.tensor([-0.5, 0.0, 0.6, 1.5], dtype=torch.float64)
+        query_y = torch.tensor([0.0, -0.2, 0.5, 0.0], dtype=torch.float64)
+
+        interp_vals = _interp_cubic_scattered(Kvec, values, query_x, query_y)
+        torch.testing.assert_close(interp_vals[:3], values[:3], atol=2e-2, rtol=0.0)
+        torch.testing.assert_close(interp_vals[3:], torch.zeros(1, dtype=torch.complex128), atol=1e-12, rtol=0.0)
+
+    def test_interpolate_precomputed_scattering_cutoff_zeros_large_values(self):
+        recon = DbarReconstruction2D(
+            image_size=8,
+            n_boundary_nodes=32,
+            n_modes=15,
+            k_grid_size=8,
+            k_radius=2.0,
+        )
+        x = torch.linspace(-2.0, 2.0, 9, dtype=torch.float32)
+        y = torch.linspace(-2.0, 2.0, 9, dtype=torch.float32)
+        K2, K1 = torch.meshgrid(y, x, indexing="ij")
+        tBIE = torch.full(K1.shape, 100.0 + 100.0j, dtype=torch.complex64)
+
+        out = recon.interpolate_precomputed_scattering(tBIE, K1=K1, K2=K2, cutoff=25.0)
+        torch.testing.assert_close(out, torch.zeros_like(out), atol=1e-6, rtol=0.0)
+
     def test_forward_square_zero_scattering_returns_ones(self):
         eq = DiffusionEquation2D(grid_size=16, domain_size=2.0, grid_type="node")
         sigma = torch.ones((eq.Nx, eq.Ny), dtype=torch.float64)
@@ -152,15 +204,33 @@ class TestDbarReconstruction(absltest.TestCase):
         self.assertEqual(sigma_rec.shape, (1, 16, 16))
         torch.testing.assert_close(sigma_rec, torch.ones_like(sigma_rec), atol=1e-10, rtol=0.0)
 
+    def test_square_reconstruction_grid_matches_domain_size(self):
+        recon = DbarReconstruction2D(
+            image_size=16,
+            n_boundary_nodes=128,
+            n_modes=7,
+            n_electrodes=8,
+            k_grid_size=16,
+            k_radius=2.0,
+            domain_shape="square",
+            domain_size=(1.0, math.pi),
+        )
+        z_grid = torch.as_tensor(recon.z_grid)
+
+        torch.testing.assert_close(z_grid.real[0, 0], torch.tensor(0.0, dtype=z_grid.real.dtype), atol=0.0, rtol=0.0)
+        torch.testing.assert_close(z_grid.real[0, -1], torch.tensor(1.0, dtype=z_grid.real.dtype), atol=1e-12, rtol=0.0)
+        torch.testing.assert_close(z_grid.imag[0, 0], torch.tensor(0.0, dtype=z_grid.imag.dtype), atol=0.0, rtol=0.0)
+        torch.testing.assert_close(z_grid.imag[-1, 0], torch.tensor(math.pi, dtype=z_grid.imag.dtype), atol=1e-12, rtol=0.0)
+
     def test_forward_from_measurements_square_zero_scattering_returns_ones(self):
-        eq = DiffusionEquation2D(grid_size=16, domain_size=2.0, grid_type="node")
+        eq = DiffusionEquation2D(grid_size=32, domain_size=2.0, grid_type="node")
         sigma = torch.ones((eq.Nx, eq.Ny), dtype=torch.float64)
         currents = make_adjacent_current_patterns(8, dtype=torch.float64).transpose(0, 1)
         _, electrode_voltages = eq.solve_cem(sigma, currents, z_contact=1.0, n_electrodes=8)
         voltage_matrix = electrode_voltages.transpose(0, 1)
 
         recon = DbarReconstruction2D(
-            image_size=16,
+            image_size=32,
             n_boundary_nodes=128,
             n_modes=7,
             n_electrodes=8,
@@ -174,7 +244,7 @@ class TestDbarReconstruction(absltest.TestCase):
             voltages=voltage_matrix,
             reference_voltages=voltage_matrix,
         )
-        self.assertEqual(sigma_rec.shape, (1, 16, 16))
+        self.assertEqual(sigma_rec.shape, (1, 32, 32))
         torch.testing.assert_close(sigma_rec, torch.ones_like(sigma_rec), atol=1e-10, rtol=0.0)
 
 if __name__ == "__main__":
