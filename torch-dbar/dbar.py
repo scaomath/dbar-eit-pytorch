@@ -33,6 +33,14 @@ import torch
 import torch.nn as nn
 
 __all__ = [
+    "make_square_trig_mode_indices",
+    "arc_length_params_square",
+    "square_boundary_points_from_angles",
+    "transform_adjacent_to_square_trig",
+    "build_nd_map_from_electrode_data",
+    "build_dn_map_from_electrode_data",
+    "compute_psi_BIE_square",
+    "compute_tBIE_square",
     "make_trig_basis",
     "make_reference_dn_map",
     "make_mean_free_projector",
@@ -50,6 +58,361 @@ def _complex_dtype_from(dtype: torch.dtype) -> torch.dtype:
     if dtype in (torch.float16, torch.bfloat16, torch.float32, torch.complex64):
         return torch.complex64
     raise TypeError(f"Unsupported dtype for complex conversion: {dtype}.")
+
+
+def _normalize_square_domain_size(domain_size: float | tuple[float, float]) -> tuple[float, float]:
+    if isinstance(domain_size, (float, int)):
+        return float(domain_size), float(domain_size)
+    if len(domain_size) != 2:
+        raise ValueError(f"domain_size must be a scalar or length-2 tuple, got {domain_size}.")
+    return float(domain_size[0]), float(domain_size[1])
+
+
+def make_square_trig_mode_indices(
+    n_electrodes: int,
+    *,
+    device: torch.device | None = None,
+    dtype: torch.dtype = torch.int64,
+) -> torch.Tensor:
+    if n_electrodes < 2:
+        raise ValueError(f"n_electrodes must be at least 2, got {n_electrodes}.")
+    if n_electrodes % 2 != 0:
+        raise ValueError("Square-boundary trig projection currently expects an even number of electrodes.")
+
+    half = n_electrodes // 2
+    ascending = torch.arange(1, half + 1, device=device, dtype=dtype)
+    descending = torch.arange(half - 1, 0, -1, device=device, dtype=dtype)
+    return torch.cat((ascending, descending), dim=0)
+
+
+def arc_length_params_square(
+    n_electrodes: int,
+    domain_size: float | tuple[float, float] = 2.0,
+    *,
+    n_boundary_samples: int = 512,
+    device: torch.device | None = None,
+    dtype: torch.dtype = torch.float64,
+) -> tuple[torch.Tensor, float, torch.Tensor]:
+    if n_boundary_samples < n_electrodes:
+        raise ValueError(
+            f"n_boundary_samples must be >= n_electrodes, got {n_boundary_samples} and {n_electrodes}."
+        )
+
+    Lx, Ly = _normalize_square_domain_size(domain_size)
+    perimeter = 2.0 * (Lx + Ly)
+    electrode_edges = torch.linspace(0.0, perimeter, n_electrodes + 1, device=device, dtype=dtype)
+    electrode_mid = 0.5 * (electrode_edges[:-1] + electrode_edges[1:])
+
+    fii = torch.linspace(0.0, 2.0 * math.pi, n_boundary_samples + 1, device=device, dtype=dtype)[:-1]
+    Dfii = float(2.0 * math.pi / n_boundary_samples)
+    gamma_mid = (2.0 * math.pi / perimeter) * electrode_mid
+    return fii, Dfii, gamma_mid
+
+
+def square_boundary_points_from_angles(
+    theta_arc: torch.Tensor,
+    *,
+    domain_size: float | tuple[float, float] = 2.0,
+) -> torch.Tensor:
+    theta_arc = torch.as_tensor(theta_arc)
+    Lx, Ly = _normalize_square_domain_size(domain_size)
+    perimeter = 2.0 * (Lx + Ly)
+    s = (theta_arc.to(dtype=torch.float64) / (2.0 * math.pi)) * perimeter
+    s = torch.remainder(s, perimeter)
+
+    z = torch.empty_like(s, dtype=torch.complex128)
+
+    bottom = s < Lx
+    right = (s >= Lx) & (s < Lx + Ly)
+    top = (s >= Lx + Ly) & (s < 2.0 * Lx + Ly)
+    left = ~(bottom | right | top)
+
+    x = torch.empty_like(s)
+    y = torch.empty_like(s)
+
+    x[bottom] = s[bottom]
+    y[bottom] = 0.0
+
+    x[right] = Lx
+    y[right] = s[right] - Lx
+
+    x[top] = 2.0 * Lx + Ly - s[top]
+    y[top] = Ly
+
+    x[left] = 0.0
+    y[left] = perimeter - s[left]
+
+    z.real = x
+    z.imag = y
+    return z.to(device=theta_arc.device, dtype=_complex_dtype_from(theta_arc.dtype))
+
+
+def _square_trig_current_basis(
+    n_electrodes: int,
+    *,
+    domain_size: float | tuple[float, float] = 2.0,
+    trig_mode_indices: torch.Tensor | None = None,
+    device: torch.device | None = None,
+    dtype: torch.dtype = torch.float64,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if trig_mode_indices is None:
+        trig_mode_indices = make_square_trig_mode_indices(n_electrodes, device=device)
+    else:
+        trig_mode_indices = torch.as_tensor(trig_mode_indices, device=device)
+
+    trig_mode_indices = trig_mode_indices.to(device=device, dtype=dtype)
+    Lx, Ly = _normalize_square_domain_size(domain_size)
+    perimeter = 2.0 * (Lx + Ly)
+    electrode_starts = torch.linspace(0.0, perimeter, n_electrodes + 1, device=device, dtype=dtype)[:-1]
+    theta_start = (2.0 * math.pi / perimeter) * electrode_starts
+
+    aad = torch.eye(n_electrodes, dtype=dtype, device=device)
+    aad[torch.arange(1, n_electrodes, device=device), torch.arange(n_electrodes - 1, device=device)] -= 1.0
+    aad[0, n_electrodes - 1] = -1.0
+    aad /= math.sqrt(2.0)
+
+    n_basis = trig_mode_indices.numel()
+    atrig = torch.zeros((n_electrodes, n_basis), dtype=dtype, device=device)
+    norm_trig = math.sqrt(2.0 / n_electrodes)
+    split = n_electrodes // 2
+
+    for k in range(split - 1):
+        atrig[:, k] = norm_trig * torch.cos(trig_mode_indices[k] * theta_start)
+    atrig[:, split - 1] = (1.0 / math.sqrt(float(n_electrodes))) * torch.cos(
+        trig_mode_indices[split - 1] * theta_start
+    )
+    for k in range(split, n_basis):
+        atrig[:, k] = norm_trig * torch.sin(trig_mode_indices[k] * theta_start)
+
+    coeff = atrig.transpose(0, 1) @ aad
+    return coeff, atrig, trig_mode_indices.to(dtype=torch.int64)
+
+
+def transform_adjacent_to_square_trig(
+    electrode_voltages: torch.Tensor,
+    *,
+    domain_size: float | tuple[float, float] = 2.0,
+    trig_mode_indices: torch.Tensor | None = None,
+) -> torch.Tensor:
+    voltages, squeeze = _as_batch_square_matrix(torch.as_tensor(electrode_voltages), "electrode_voltages")
+    n_electrodes = voltages.shape[-1]
+    real_dtype = torch.float64 if voltages.dtype in (torch.float64, torch.complex128) else torch.float32
+    coeff, _, _ = _square_trig_current_basis(
+        n_electrodes,
+        domain_size=domain_size,
+        trig_mode_indices=trig_mode_indices,
+        device=voltages.device,
+        dtype=real_dtype,
+    )
+
+    transformed = []
+    for batch_idx in range(voltages.shape[0]):
+        U = voltages[batch_idx].to(dtype=_complex_dtype_from(voltages.dtype))
+        U = U - U.mean(dim=0, keepdim=True)
+        solution = torch.linalg.lstsq(
+            coeff.transpose(0, 1).to(dtype=U.dtype),
+            U.transpose(0, 1),
+        ).solution.transpose(0, 1)
+        transformed.append(solution)
+
+    out = torch.stack(transformed, dim=0)
+    return out[0] if squeeze else out
+
+
+def _square_trace_from_trig_voltages(
+    trig_voltages: torch.Tensor,
+    *,
+    fii: torch.Tensor,
+    domain_size: float | tuple[float, float] = 2.0,
+) -> torch.Tensor:
+    n_electrodes = trig_voltages.shape[0]
+    electrode_idx = torch.floor(fii / (2.0 * math.pi / n_electrodes)).to(dtype=torch.int64)
+    electrode_idx = electrode_idx.clamp(max=n_electrodes - 1)
+    trace = trig_voltages[electrode_idx, :]
+    return trace - trace.mean(dim=0, keepdim=True)
+
+
+def _square_trig_boundary_matrix(
+    trig_mode_indices: torch.Tensor,
+    fii: torch.Tensor,
+) -> torch.Tensor:
+    n_basis = trig_mode_indices.numel()
+    B = torch.zeros((n_basis, fii.numel()), dtype=fii.dtype, device=fii.device)
+    split = (n_basis + 1) // 2
+    trig_mode_indices = trig_mode_indices.to(device=fii.device, dtype=fii.dtype)
+
+    for j in range(n_basis):
+        if j < split:
+            B[j, :] = torch.cos(trig_mode_indices[j] * fii)
+        else:
+            B[j, :] = torch.sin(trig_mode_indices[j] * fii)
+    return B
+
+
+def build_nd_map_from_electrode_data(
+    electrode_voltages: torch.Tensor,
+    *,
+    domain_size: float | tuple[float, float] = 2.0,
+    trig_mode_indices: torch.Tensor | None = None,
+    n_boundary_samples: int = 512,
+) -> torch.Tensor:
+    trig_voltages = transform_adjacent_to_square_trig(
+        electrode_voltages,
+        domain_size=domain_size,
+        trig_mode_indices=trig_mode_indices,
+    )
+    if trig_voltages.dim() == 2:
+        trig_voltages = trig_voltages.unsqueeze(0)
+        squeeze = True
+    elif trig_voltages.dim() == 3:
+        squeeze = False
+    else:
+        raise ValueError(
+            f"trig_voltages must have shape (L, nBasis) or (B, L, nBasis), got {tuple(trig_voltages.shape)}."
+        )
+
+    n_electrodes = trig_voltages.shape[-2]
+    fii, Dfii, _ = arc_length_params_square(
+        n_electrodes,
+        domain_size=domain_size,
+        n_boundary_samples=n_boundary_samples,
+        device=trig_voltages.device,
+        dtype=trig_voltages.real.dtype,
+    )
+    if trig_mode_indices is None:
+        trig_mode_indices = make_square_trig_mode_indices(n_electrodes, device=trig_voltages.device)
+    else:
+        trig_mode_indices = torch.as_tensor(trig_mode_indices, device=trig_voltages.device)
+
+    B = _square_trig_boundary_matrix(trig_mode_indices, fii).to(dtype=trig_voltages.dtype)
+    nd_maps = []
+    for batch_idx in range(trig_voltages.shape[0]):
+        trace = _square_trace_from_trig_voltages(
+            trig_voltages[batch_idx],
+            fii=fii,
+            domain_size=domain_size,
+        ).to(dtype=trig_voltages.dtype)
+        nd_map = Dfii * (B @ trace)
+        nd_maps.append(0.5 * (nd_map + nd_map.transpose(-1, -2).conj()))
+
+    out = torch.stack(nd_maps, dim=0)
+    return out[0] if squeeze else out
+
+
+def build_dn_map_from_electrode_data(
+    electrode_voltages: torch.Tensor,
+    *,
+    domain_size: float | tuple[float, float] = 2.0,
+    trig_mode_indices: torch.Tensor | None = None,
+    n_boundary_samples: int = 512,
+    regularization: float = 1e-6,
+    rcond: float | None = None,
+) -> torch.Tensor:
+    nd_map = build_nd_map_from_electrode_data(
+        electrode_voltages,
+        domain_size=domain_size,
+        trig_mode_indices=trig_mode_indices,
+        n_boundary_samples=n_boundary_samples,
+    )
+    return nd_to_dn_map(nd_map, regularization=regularization, rcond=rcond)
+
+
+def _square_trig_synthesis_matrix(
+    trig_mode_indices: torch.Tensor,
+    theta_arc: torch.Tensor,
+) -> torch.Tensor:
+    n_basis = trig_mode_indices.numel()
+    split = (n_basis + 1) // 2
+    theta_arc = theta_arc.to(dtype=torch.float64)
+    trig_mode_indices = trig_mode_indices.to(device=theta_arc.device, dtype=theta_arc.dtype)
+    basis = torch.zeros((theta_arc.numel(), n_basis), dtype=theta_arc.dtype, device=theta_arc.device)
+    for j in range(n_basis):
+        if j < split:
+            basis[:, j] = (1.0 / math.sqrt(math.pi)) * torch.cos(trig_mode_indices[j] * theta_arc)
+        else:
+            basis[:, j] = (1.0 / math.sqrt(math.pi)) * torch.sin(trig_mode_indices[j] * theta_arc)
+    return basis
+
+
+def compute_psi_BIE_square(
+    Kvec: torch.Tensor,
+    theta_arc: torch.Tensor,
+    trig_mode_indices: torch.Tensor,
+    *,
+    domain_size: float | tuple[float, float] = 2.0,
+    Dtheta: float | None = None,
+) -> torch.Tensor:
+    Kvec = torch.as_tensor(Kvec)
+    theta_arc = torch.as_tensor(theta_arc, device=Kvec.device)
+    trig_mode_indices = torch.as_tensor(trig_mode_indices, device=Kvec.device)
+    complex_dtype = _complex_dtype_from(Kvec.dtype)
+    real_dtype = torch.float64 if complex_dtype == torch.complex128 else torch.float32
+
+    theta_arc = theta_arc.to(dtype=real_dtype)
+    trig_mode_indices = trig_mode_indices.to(dtype=torch.int64)
+    Kvec = Kvec.to(dtype=complex_dtype)
+    if Dtheta is None:
+        if theta_arc.numel() < 2:
+            raise ValueError("Dtheta is required when theta_arc has fewer than two samples.")
+        Dtheta = float(theta_arc[1] - theta_arc[0])
+
+    boundary_points = square_boundary_points_from_angles(theta_arc, domain_size=domain_size).to(dtype=complex_dtype)
+    phase = torch.exp(1j * boundary_points[:, None] * Kvec[None, :])
+
+    n_basis = trig_mode_indices.numel()
+    split = (n_basis + 1) // 2
+    basis = torch.zeros((n_basis, theta_arc.numel()), dtype=real_dtype, device=theta_arc.device)
+    trig_mode_indices_real = trig_mode_indices.to(dtype=real_dtype)
+    for j in range(n_basis):
+        if j < split:
+            basis[j, :] = (1.0 / math.sqrt(math.pi)) * torch.cos(trig_mode_indices_real[j] * theta_arc)
+        else:
+            basis[j, :] = (1.0 / math.sqrt(math.pi)) * torch.sin(trig_mode_indices_real[j] * theta_arc)
+
+    return Dtheta * (basis.to(dtype=complex_dtype) @ phase)
+
+
+def compute_tBIE_square(
+    *,
+    Kvec: torch.Tensor,
+    DN: torch.Tensor,
+    DN1: torch.Tensor,
+    Fpsi_BIE: torch.Tensor,
+    theta_arc: torch.Tensor,
+    domain_size: float | tuple[float, float] = 2.0,
+    trig_mode_indices: torch.Tensor | None = None,
+    Dtheta: float | None = None,
+) -> torch.Tensor:
+    Kvec = torch.as_tensor(Kvec)
+    DN = torch.as_tensor(DN)
+    DN1 = torch.as_tensor(DN1, device=DN.device)
+    Fpsi_BIE = torch.as_tensor(Fpsi_BIE, device=DN.device)
+    theta_arc = torch.as_tensor(theta_arc, device=DN.device)
+
+    complex_dtype = _complex_dtype_from(torch.promote_types(Kvec.dtype, DN.dtype))
+    real_dtype = torch.float64 if complex_dtype == torch.complex128 else torch.float32
+    if trig_mode_indices is None:
+        trig_mode_indices = make_square_trig_mode_indices(DN.shape[-1] + 1, device=DN.device)
+    else:
+        trig_mode_indices = torch.as_tensor(trig_mode_indices, device=DN.device)
+
+    Kvec = Kvec.to(dtype=complex_dtype, device=DN.device)
+    DN = DN.to(dtype=complex_dtype)
+    DN1 = DN1.to(dtype=complex_dtype)
+    Fpsi_BIE = Fpsi_BIE.to(dtype=complex_dtype)
+    theta_arc = theta_arc.to(dtype=real_dtype)
+    if Dtheta is None:
+        if theta_arc.numel() < 2:
+            raise ValueError("Dtheta is required when theta_arc has fewer than two samples.")
+        Dtheta = float(theta_arc[1] - theta_arc[0])
+
+    T_basis = _square_trig_synthesis_matrix(trig_mode_indices, theta_arc).to(dtype=complex_dtype)
+    FLLpsi = (DN - DN1) @ Fpsi_BIE
+    LLpsi = T_basis @ FLLpsi
+
+    boundary_points = square_boundary_points_from_angles(theta_arc, domain_size=domain_size).to(dtype=complex_dtype)
+    exp_phase = torch.exp(1j * torch.conj(Kvec)[None, :] * torch.conj(boundary_points)[:, None])
+    return Dtheta * torch.einsum("ij,ij->j", exp_phase, LLpsi)
 
 
 def _as_batch_square_matrix(x: torch.Tensor, name: str) -> tuple[torch.Tensor, bool]:
@@ -114,6 +477,23 @@ def _as_batch_scattering_grid(
         f"{name} must have shape ({expected_size}, {expected_size}) or "
         f"(B, {expected_size}, {expected_size}), got {tuple(x.shape)}."
     )
+
+
+def _rect_grid_coords(
+    K1: np.ndarray,
+    K2: np.ndarray,
+    values: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    x_coords = np.asarray(K1[0, :], dtype=np.float64)
+    y_coords = np.asarray(K2[:, 0], dtype=np.float64)
+    vals = np.asarray(values)
+    if x_coords[0] > x_coords[-1]:
+        x_coords = x_coords[::-1]
+        vals = vals[:, ::-1]
+    if y_coords[0] > y_coords[-1]:
+        y_coords = y_coords[::-1]
+        vals = vals[::-1, :]
+    return x_coords, y_coords, vals
 
 
 def _interp2_bicubic_rect_grid(
@@ -291,6 +671,7 @@ class DbarReconstruction2D(nn.Module):
         image_size: int = 64,
         n_boundary_nodes: int = 64,
         n_modes: int = 31,
+        n_electrodes: int | None = None,
         k_grid_size: int = 64,
         k_radius: float = 6.0,
         k_extent: float | None = None,
@@ -300,11 +681,18 @@ class DbarReconstruction2D(nn.Module):
         z_chunk_size: int = 1024,
         eps: float = 1e-6,
         background_conductivity: float = 1.0,
+        domain_shape: str = "circle",
+        domain_size: float | tuple[float, float] = 2.0,
     ) -> None:
         super().__init__()
+        domain_shape = domain_shape.lower()
+        if domain_shape not in {"circle", "square"}:
+            raise ValueError(f"domain_shape must be 'circle' or 'square', got {domain_shape}.")
+
         self.image_size = image_size
         self.n_boundary_nodes = n_boundary_nodes
         self.n_modes = n_modes
+        self.n_electrodes = n_modes + 1 if n_electrodes is None else n_electrodes
         self.k_grid_size = k_grid_size
         self.k_radius = k_radius
         self.k_extent = k_radius if k_extent is None else k_extent
@@ -316,10 +704,30 @@ class DbarReconstruction2D(nn.Module):
         self.z_chunk_size = z_chunk_size
         self.eps = eps
         self.background_conductivity = background_conductivity  # retained for API compatibility
-        self.boundary_weight = 2.0 * math.pi / float(n_boundary_nodes)
+        self.domain_shape = domain_shape
+        self.domain_size = domain_size
 
-        _, _, theta = make_trig_basis(n_boundary_nodes, n_modes)
-        boundary_points = torch.polar(torch.ones_like(theta), theta)
+        if self.domain_shape == "square":
+            if self.n_electrodes % 2 != 0:
+                raise ValueError("Square-domain D-bar requires an even number of electrodes.")
+            if self.n_modes != self.n_electrodes - 1:
+                raise ValueError(
+                    f"For domain_shape='square', expected n_modes == n_electrodes - 1, got {self.n_modes} and {self.n_electrodes}."
+                )
+            theta, boundary_weight, _ = arc_length_params_square(
+                self.n_electrodes,
+                domain_size=domain_size,
+                n_boundary_samples=n_boundary_nodes,
+            )
+            boundary_points = square_boundary_points_from_angles(theta, domain_size=domain_size)
+            trig_mode_indices = make_square_trig_mode_indices(self.n_electrodes)
+            lambda_ref = torch.zeros((self.n_modes, self.n_modes), dtype=torch.float32)
+        else:
+            boundary_weight = 2.0 * math.pi / float(n_boundary_nodes)
+            _, _, theta = make_trig_basis(n_boundary_nodes, n_modes)
+            boundary_points = torch.polar(torch.ones_like(theta), theta)
+            trig_mode_indices = torch.empty(0, dtype=torch.int64)
+            lambda_ref = make_reference_dn_map(n_boundary_nodes=n_boundary_nodes, n_modes=n_modes)
 
         xy = torch.linspace(-1.0, 1.0, image_size)
         yy, xx = torch.meshgrid(xy, xy, indexing="ij")
@@ -332,22 +740,72 @@ class DbarReconstruction2D(nn.Module):
         k_mask = (kxx.square() + kyy.square()) <= (k_radius ** 2)
 
         dk = float(kx[1] - kx[0]) if k_grid_size > 1 else 1.0
-        lambda_ref = make_reference_dn_map(n_boundary_nodes=n_boundary_nodes, n_modes=n_modes)
 
         self.register_buffer("theta", theta)
         self.register_buffer("boundary_points", boundary_points)
+        self.register_buffer("trig_mode_indices", trig_mode_indices)
         self.register_buffer("z_grid", z_grid)
         self.register_buffer("k_grid", k_grid)
         self.register_buffer("k_mask", k_mask)
         self.register_buffer("dk", torch.tensor(dk, dtype=torch.float32))
+        self.register_buffer("boundary_weight", torch.tensor(boundary_weight, dtype=torch.float32))
         self.register_buffer("lambda_ref", lambda_ref)
 
     def extra_repr(self) -> str:
         return (
-            f"image_size={self.image_size}, n_boundary_nodes={self.n_boundary_nodes}, "
+            f"domain_shape={self.domain_shape}, image_size={self.image_size}, n_boundary_nodes={self.n_boundary_nodes}, "
             f"n_modes={self.n_modes}, k_grid_size={self.k_grid_size}, "
             f"k_radius={self.k_radius}, k_extent={self.k_extent}"
         )
+
+    def compute_scattering_transform_square(
+        self,
+        lambda_sigma: torch.Tensor,
+        lambda_ref: torch.Tensor,
+    ) -> torch.Tensor:
+        expected_shape = (self.n_modes, self.n_modes)
+        if lambda_sigma.shape[-2:] != expected_shape:
+            raise ValueError(
+                f"Expected lambda_sigma with shape (*, {expected_shape[0]}, {expected_shape[1]}), got {tuple(lambda_sigma.shape)}."
+            )
+        if lambda_ref.shape[-2:] != expected_shape:
+            raise ValueError(
+                f"Expected lambda_ref with shape (*, {expected_shape[0]}, {expected_shape[1]}), got {tuple(lambda_ref.shape)}."
+            )
+
+        complex_dtype = _complex_dtype_from(torch.promote_types(lambda_sigma.dtype, lambda_ref.dtype))
+        k_mask = self.k_mask.reshape(-1)
+        kvec = self.k_grid.reshape(-1)[k_mask].to(dtype=complex_dtype)
+        theta_arc = self.theta.to(dtype=self.boundary_points.real.dtype)
+        Dtheta = float(self.boundary_weight.item())
+        Fpsi_BIE = compute_psi_BIE_square(
+            kvec,
+            theta_arc,
+            self.trig_mode_indices,
+            domain_size=self.domain_size,
+            Dtheta=Dtheta,
+        ).to(device=self.k_grid.device, dtype=complex_dtype)
+
+        out = torch.zeros(
+            (lambda_sigma.shape[0], self.k_grid_size, self.k_grid_size),
+            dtype=complex_dtype,
+            device=self.k_grid.device,
+        )
+        for batch_idx in range(lambda_sigma.shape[0]):
+            tbie = compute_tBIE_square(
+                Kvec=kvec,
+                DN=lambda_sigma[batch_idx],
+                DN1=lambda_ref[batch_idx],
+                Fpsi_BIE=Fpsi_BIE,
+                theta_arc=theta_arc,
+                domain_size=self.domain_size,
+                trig_mode_indices=self.trig_mode_indices,
+                Dtheta=Dtheta,
+            ).to(dtype=complex_dtype, device=self.k_grid.device)
+            flat = torch.zeros(self.k_grid.numel(), dtype=complex_dtype, device=self.k_grid.device)
+            flat[k_mask] = self.scattering_scale * tbie
+            out[batch_idx] = flat.reshape(self.k_grid_size, self.k_grid_size)
+        return out
 
     def compute_scattering_transform(self, delta_lambda: torch.Tensor) -> torch.Tensor:
         if delta_lambda.shape[-2:] != (self.n_boundary_nodes, self.n_boundary_nodes):
@@ -391,7 +849,7 @@ class DbarReconstruction2D(nn.Module):
         if K1 is None and Kvec is None:
             raise ValueError("Provide either (K1, K2) or Kvec.")
 
-        grid_shape = tuple(K1.shape) if K1 is not None else None
+        grid_shape = (int(K1.shape[0]), int(K1.shape[1])) if K1 is not None else None
         tBIE, squeeze = _as_batch_scattering_samples(tBIE, "tBIE", grid_shape=grid_shape)
         complex_dtype = _complex_dtype_from(tBIE.dtype)
         out = torch.zeros(
@@ -504,6 +962,8 @@ class DbarReconstruction2D(nn.Module):
         lambda_sigma = lambda_sigma.to(device=device, dtype=complex_dtype)
 
         if lambda_ref is None:
+            if self.domain_shape == "square":
+                raise ValueError("Square-domain D-bar reconstruction requires an explicit reference DN map.")
             lambda_ref_batch = self.lambda_ref.to(device=device, dtype=complex_dtype).unsqueeze(0)
         else:
             lambda_ref_batch, _ = _as_batch_square_matrix(lambda_ref, "lambda_ref")
@@ -516,8 +976,11 @@ class DbarReconstruction2D(nn.Module):
                 f"lambda_ref batch dimension must be 1 or {lambda_sigma.shape[0]}, got {lambda_ref_batch.shape[0]}."
             )
 
-        delta_lambda = lambda_sigma - lambda_ref_batch
-        t_exp = self.compute_scattering_transform(delta_lambda)
+        if self.domain_shape == "square":
+            t_exp = self.compute_scattering_transform_square(lambda_sigma, lambda_ref_batch)
+        else:
+            delta_lambda = lambda_sigma - lambda_ref_batch
+            t_exp = self.compute_scattering_transform(delta_lambda)
         sigma = self.solve_sigma(t_exp)
         return sigma[0] if squeeze else sigma
 
@@ -535,6 +998,24 @@ class DbarReconstruction2D(nn.Module):
             "it uses approximate ND/DN/scattering surrogates.",
             stacklevel=2,
         )
+        if self.domain_shape == "square":
+            if reference_voltages is None:
+                raise ValueError("Square-domain D-bar reconstruction requires reference_voltages.")
+
+            lambda_sigma = build_dn_map_from_electrode_data(
+                voltages,
+                domain_size=self.domain_size,
+                trig_mode_indices=self.trig_mode_indices,
+                n_boundary_samples=self.n_boundary_nodes,
+            )
+            lambda_ref = build_dn_map_from_electrode_data(
+                reference_voltages,
+                domain_size=self.domain_size,
+                trig_mode_indices=self.trig_mode_indices,
+                n_boundary_samples=self.n_boundary_nodes,
+            )
+            return self.forward(lambda_sigma=lambda_sigma, lambda_ref=lambda_ref)
+
         lambda_sigma = estimate_dn_map(currents=currents, voltages=voltages, regularization=regularization)
 
         lambda_ref = None

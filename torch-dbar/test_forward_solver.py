@@ -1,6 +1,6 @@
 import sys
 import os
-from forward_solver import DiffusionEquation2D
+from forward_solver import DiffusionEquation2D, electrode_builder_square
 
 import math
 import torch
@@ -63,6 +63,69 @@ class TestForwardSolver(parameterized.TestCase):
         result = eq.forward(sigma, u)
         expected = torch.full((eq.Nx_int, eq.Ny_int), -4.0, dtype=torch.float64)
         torch.testing.assert_close(result[1:-1, 1:-1], expected, atol=1e-10, rtol=0.0)
+
+    def test_electrode_builder_square(self):
+        electrodes = electrode_builder_square(8, domain_size=1.0)
+        expected = torch.tensor(
+            [
+                [0.0, 0.5],
+                [0.5, 1.0],
+                [1.0, 1.5],
+                [1.5, 2.0],
+                [2.0, 2.5],
+                [2.5, 3.0],
+                [3.0, 3.5],
+                [3.5, 4.0],
+            ],
+            dtype=torch.float64,
+        )
+        torch.testing.assert_close(electrodes, expected)
+
+    @parameterized.named_parameters(
+        ("node", "node"),
+        ("staggered", "staggered"),
+    )
+    def test_solve_cem_zero_current(self, grid_type):
+        eq = DiffusionEquation2D(grid_size=16, domain_size=1.0, grid_type=grid_type)
+        if grid_type == "node":
+            sigma = torch.ones((eq.Nx, eq.Ny), dtype=torch.float64)
+        else:
+            sigma = torch.ones((eq.Nx - 1, eq.Ny - 1), dtype=torch.float64)
+
+        u, electrode_voltages = eq.solve_cem(
+            sigma,
+            torch.zeros(8, dtype=torch.float64),
+            z_contact=1.0,
+            n_electrodes=8,
+        )
+        torch.testing.assert_close(u, torch.zeros_like(u), atol=1e-10, rtol=0.0)
+        torch.testing.assert_close(
+            electrode_voltages,
+            torch.zeros_like(electrode_voltages),
+            atol=1e-10,
+            rtol=0.0,
+        )
+
+    @parameterized.named_parameters(
+        ("node", "node"),
+        ("staggered", "staggered"),
+    )
+    def test_neumann_dirichlet_maps_are_finite(self, grid_type):
+        eq = DiffusionEquation2D(grid_size=16, domain_size=1.0, grid_type=grid_type)
+        if grid_type == "node":
+            sigma = torch.ones((eq.Nx, eq.Ny), dtype=torch.float64)
+        else:
+            sigma = torch.ones((eq.Nx - 1, eq.Ny - 1), dtype=torch.float64)
+
+        nd_map = eq.neumann_to_dirichlet(sigma, n_electrodes=8, z_contact=1.0)
+        dn_map = eq.dirichlet_to_neumann(sigma, n_electrodes=8, z_contact=1.0)
+
+        self.assertEqual(nd_map.shape, (8, 8))
+        self.assertEqual(dn_map.shape, (8, 8))
+        self.assertTrue(torch.isfinite(nd_map).all().item())
+        self.assertTrue(torch.isfinite(dn_map).all().item())
+        torch.testing.assert_close(nd_map, nd_map.transpose(0, 1), atol=1e-10, rtol=0.0)
+        torch.testing.assert_close(dn_map, dn_map.transpose(0, 1), atol=1e-10, rtol=0.0)
 
 
 if __name__ == '__main__':

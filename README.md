@@ -1,4 +1,7 @@
 # D-bar Method for Electrical Impedance Tomography in PyTorch 
+
+[![Python 3.10](https://img.shields.io/badge/python-3.10-blue.svg)](https://www.python.org/downloads/release/python-3100/)
+
 This repository has an implementation of D-bar method (both solve and approximation) natively in PyTorch, compatible with `torch.autograd`.
 
 
