@@ -152,10 +152,9 @@ The Born solver is already in `dbar.py::solve_sigma()`.
 ---
 
 ## Verification
-1. Unit test `dirichlet_to_neumann` on `$\sigma = 1$`: DN-map eigenvalues should scale like `|n|` in the Fourier basis.
+1. Unit test `dirichlet_to_neumann` on `$\sigma = 1$`: DN-map eigenvalues should scale like `|n|` in the Fourier basis-like solution $\sin(n_1 x)\sinh(n_2 y)$.
 2. Sanity-check that scattering transform `T(k)` tends to `0` as `k -> infinity` for smooth `$\sigma$`.
-3. Run an end-to-end synthetic case, for example a disk inclusion in a square, and confirm the
-   reconstruction qualitatively matches the target `$\sigma$`.
+3. Run an end-to-end synthetic case, for example a disk inclusion in a square, and confirm the reconstruction qualitatively matches the target `$\sigma$`.
 4. Run the regression suite in `test_forward_solver.py` after the Phase 1 changes.
 
 ---

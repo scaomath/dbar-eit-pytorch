@@ -658,11 +658,6 @@ class DbarReconstruction2D(nn.Module):
     Approximate continuum D-bar preprocessor for square-grid outputs.
 
     Notes:
-        - `forward_from_measurements(...)` is a high-level surrogate for MATLAB
-          `comp02_*` to `comp05_*` examples.
-        - `forward_from_precomputed_scattering(...)` mirrors the interpolation
-          stage of `comp06_Dbarsolve.m`, but `solve_sigma(...)` is still not
-          the MATLAB GMRES D-bar solve.
         - no unit-disk masking is applied anywhere in this module.
     """
 
