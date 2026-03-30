@@ -11,7 +11,8 @@ from dbar import (
     compute_psi_BIE_square,
     compute_tBIE_square,
 )
-from forward_solver import DiffusionEquation2D, make_adjacent_current_patterns
+from cem_solver import CompleteElectrodeModel, generate_adjacent_current_patterns
+from forward_solver import DiffusionEquation2D
 
 import math
 import torch
@@ -30,9 +31,10 @@ class TestDbarBoundary(parameterized.TestCase):
 
     def test_build_nd_map_uses_default_electrode_scale(self):
         eq = DiffusionEquation2D(grid_size=16, domain_size=2.0, grid_type="node")
+        cem = CompleteElectrodeModel(eq)
         sigma = torch.ones((eq.Nx, eq.Ny), dtype=torch.float64)
-        currents = make_adjacent_current_patterns(8, dtype=torch.float64).transpose(0, 1)
-        _, electrode_voltages = eq.solve_cem(sigma, currents, z_contact=1.0, n_electrodes=8)
+        currents = generate_adjacent_current_patterns(8, dtype=torch.float64).transpose(0, 1)
+        _, electrode_voltages = cem.solve_cem(sigma, currents, z_contact=1.0, n_electrodes=8)
         voltage_matrix = electrode_voltages.transpose(0, 1)
 
         nd_default = build_nd_map_from_electrode_data(
@@ -81,13 +83,14 @@ class TestDbarBoundary(parameterized.TestCase):
     )
     def test_square_trig_nd_dn_from_cem(self, grid_type):
         eq = DiffusionEquation2D(grid_size=16, domain_size=2.0, grid_type=grid_type)
+        cem = CompleteElectrodeModel(eq)
         if grid_type == "node":
             sigma = torch.ones((eq.Nx, eq.Ny), dtype=torch.float64)
         else:
             sigma = torch.ones((eq.Nx - 1, eq.Ny - 1), dtype=torch.float64)
 
-        currents = make_adjacent_current_patterns(8, dtype=torch.float64).transpose(0, 1)
-        _, electrode_voltages = eq.solve_cem(sigma, currents, z_contact=1.0, n_electrodes=8)
+        currents = generate_adjacent_current_patterns(8, dtype=torch.float64).transpose(0, 1)
+        _, electrode_voltages = cem.solve_cem(sigma, currents, z_contact=1.0, n_electrodes=8)
         voltage_matrix = electrode_voltages.transpose(0, 1)
 
         nd_map = build_nd_map_from_electrode_data(
@@ -137,9 +140,10 @@ class TestDbarCGO(absltest.TestCase):
 
     def test_compute_tBIE_square_zero_reference(self):
         eq = DiffusionEquation2D(grid_size=16, domain_size=2.0, grid_type="node")
+        cem = CompleteElectrodeModel(eq)
         sigma = torch.ones((eq.Nx, eq.Ny), dtype=torch.float64)
-        currents = make_adjacent_current_patterns(8, dtype=torch.float64).transpose(0, 1)
-        _, electrode_voltages = eq.solve_cem(sigma, currents, z_contact=1.0, n_electrodes=8)
+        currents = generate_adjacent_current_patterns(8, dtype=torch.float64).transpose(0, 1)
+        _, electrode_voltages = cem.solve_cem(sigma, currents, z_contact=1.0, n_electrodes=8)
         voltage_matrix = electrode_voltages.transpose(0, 1)
         dn_map = build_dn_map_from_electrode_data(voltage_matrix, domain_size=2.0, n_boundary_samples=128)
 
@@ -381,9 +385,10 @@ class TestDbarReconstruction(absltest.TestCase):
 
     def test_forward_square_zero_scattering_returns_ones(self):
         eq = DiffusionEquation2D(grid_size=16, domain_size=2.0, grid_type="node")
+        cem = CompleteElectrodeModel(eq)
         sigma = torch.ones((eq.Nx, eq.Ny), dtype=torch.float64)
-        currents = make_adjacent_current_patterns(8, dtype=torch.float64).transpose(0, 1)
-        _, electrode_voltages = eq.solve_cem(sigma, currents, z_contact=1.0, n_electrodes=8)
+        currents = generate_adjacent_current_patterns(8, dtype=torch.float64).transpose(0, 1)
+        _, electrode_voltages = cem.solve_cem(sigma, currents, z_contact=1.0, n_electrodes=8)
         voltage_matrix = electrode_voltages.transpose(0, 1)
         dn_map = build_dn_map_from_electrode_data(voltage_matrix, domain_size=2.0, n_boundary_samples=128)
 
@@ -403,9 +408,10 @@ class TestDbarReconstruction(absltest.TestCase):
 
     def test_forward_square_zero_scattering_returns_ones_with_dbar_inverse(self):
         eq = DiffusionEquation2D(grid_size=12, domain_size=2.0, grid_type="node")
+        cem = CompleteElectrodeModel(eq)
         sigma = torch.ones((eq.Nx, eq.Ny), dtype=torch.float64)
-        currents = make_adjacent_current_patterns(8, dtype=torch.float64).transpose(0, 1)
-        _, electrode_voltages = eq.solve_cem(sigma, currents, z_contact=1.0, n_electrodes=8)
+        currents = generate_adjacent_current_patterns(8, dtype=torch.float64).transpose(0, 1)
+        _, electrode_voltages = cem.solve_cem(sigma, currents, z_contact=1.0, n_electrodes=8)
         voltage_matrix = electrode_voltages.transpose(0, 1)
         dn_map = build_dn_map_from_electrode_data(voltage_matrix, domain_size=2.0, n_boundary_samples=64)
 
@@ -447,9 +453,10 @@ class TestDbarReconstruction(absltest.TestCase):
 
     def test_forward_from_measurements_square_zero_scattering_returns_ones(self):
         eq = DiffusionEquation2D(grid_size=32, domain_size=2.0, grid_type="node")
+        cem = CompleteElectrodeModel(eq)
         sigma = torch.ones((eq.Nx, eq.Ny), dtype=torch.float64)
-        currents = make_adjacent_current_patterns(8, dtype=torch.float64).transpose(0, 1)
-        _, electrode_voltages = eq.solve_cem(sigma, currents, z_contact=1.0, n_electrodes=8)
+        currents = generate_adjacent_current_patterns(8, dtype=torch.float64).transpose(0, 1)
+        _, electrode_voltages = cem.solve_cem(sigma, currents, z_contact=1.0, n_electrodes=8)
         voltage_matrix = electrode_voltages.transpose(0, 1)
 
         recon = DbarReconstruction2D(

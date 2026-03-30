@@ -9,14 +9,16 @@ from dbar import (
     compute_tBIE_square,
     make_square_trig_mode_indices,
 )
-from forward_solver import DiffusionEquation2D, make_adjacent_current_patterns
+from cem_solver import CompleteElectrodeModel, generate_adjacent_current_patterns
+from forward_solver import DiffusionEquation2D
 
 
 def _build_reference_and_currents(grid_size: int = 24):
     eq = DiffusionEquation2D(grid_size=grid_size, domain_size=2.0, grid_type="node")
-    currents = make_adjacent_current_patterns(8, dtype=torch.float64).transpose(0, 1)
+    cem = CompleteElectrodeModel(eq)
+    currents = generate_adjacent_current_patterns(8, dtype=torch.float64).transpose(0, 1)
     sigma_ref = torch.ones((eq.Nx, eq.Ny), dtype=torch.float64)
-    _, electrode_voltages_ref = eq.solve_cem(sigma_ref, currents, z_contact=1.0, n_electrodes=8)
+    _, electrode_voltages_ref = cem.solve_cem(sigma_ref, currents, z_contact=1.0, n_electrodes=8)
     dn_ref = build_dn_map_from_electrode_data(
         electrode_voltages_ref.transpose(0, 1),
         domain_size=2.0,
@@ -54,11 +56,12 @@ class TestReconstructionVerification(absltest.TestCase):
 
     def test_scattering_reference_and_sampled_high_k_example(self):
         eq, currents, _, dn_ref = _build_reference_and_currents(grid_size=16)
+        cem = CompleteElectrodeModel(eq)
 
         sigma_smooth = torch.ones((eq.Nx, eq.Ny), dtype=torch.float64)
         mask = (eq.x_nodes - 1.0) ** 2 + (eq.y_nodes - 1.0) ** 2 <= 0.45**2
         sigma_smooth[mask] = 1.1
-        _, electrode_voltages = eq.solve_cem(sigma_smooth, currents, z_contact=1.0, n_electrodes=8)
+        _, electrode_voltages = cem.solve_cem(sigma_smooth, currents, z_contact=1.0, n_electrodes=8)
         dn_smooth = build_dn_map_from_electrode_data(
             electrode_voltages.transpose(0, 1),
             domain_size=2.0,
@@ -103,11 +106,12 @@ class TestReconstructionVerification(absltest.TestCase):
 
     def test_end_to_end_off_center_inclusion_example(self):
         eq, currents, _, dn_ref = _build_reference_and_currents(grid_size=24)
+        cem = CompleteElectrodeModel(eq)
 
         sigma_target = torch.ones((eq.Nx, eq.Ny), dtype=torch.float64)
         mask = (eq.x_nodes - 1.5) ** 2 + (eq.y_nodes - 0.6) ** 2 <= 0.35**2
         sigma_target[mask] = 0.5
-        _, electrode_voltages = eq.solve_cem(sigma_target, currents, z_contact=1.0, n_electrodes=8)
+        _, electrode_voltages = cem.solve_cem(sigma_target, currents, z_contact=1.0, n_electrodes=8)
         dn_target = build_dn_map_from_electrode_data(
             electrode_voltages.transpose(0, 1),
             domain_size=2.0,
