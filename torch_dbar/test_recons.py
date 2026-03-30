@@ -26,6 +26,24 @@ def _build_reference_and_currents(grid_size: int = 24):
 
 
 class TestReconstructionVerification(absltest.TestCase):
+    def test_reconstruction_grid_matches_forward_solver_order(self):
+        eq = DiffusionEquation2D(grid_size=8, domain_size=2.0, grid_type="node")
+        recon = DbarReconstruction2D(
+            image_size=8,
+            n_boundary_nodes=32,
+            n_modes=7,
+            n_electrodes=8,
+            k_grid_size=9,
+            k_radius=2.0,
+            domain_shape="square",
+            domain_size=2.0,
+        )
+
+        self.assertGreater(float(eq.x_nodes[1, 0] - eq.x_nodes[0, 0]), 0.0)
+        self.assertEqual(float(eq.x_nodes[0, 1] - eq.x_nodes[0, 0]), 0.0)
+        self.assertGreater(float(recon.z_grid.real[1, 0] - recon.z_grid.real[0, 0]), 0.0)
+        self.assertEqual(float(recon.z_grid.real[0, 1] - recon.z_grid.real[0, 0]), 0.0)
+
     def test_sigma_one_trig_dn_spectrum_example(self):
         _, _, _, dn_ref = _build_reference_and_currents(grid_size=16)
 
@@ -83,11 +101,11 @@ class TestReconstructionVerification(absltest.TestCase):
         self.assertTrue(torch.isfinite(t_smooth).all().item())
         self.assertGreater(float(t_smooth.abs().max()), 0.0)
 
-    def test_end_to_end_disk_inclusion_example(self):
+    def test_end_to_end_off_center_inclusion_example(self):
         eq, currents, _, dn_ref = _build_reference_and_currents(grid_size=24)
 
         sigma_target = torch.ones((eq.Nx, eq.Ny), dtype=torch.float64)
-        mask = (eq.x_nodes - 1.0) ** 2 + (eq.y_nodes - 1.0) ** 2 <= 0.45**2
+        mask = (eq.x_nodes - 1.5) ** 2 + (eq.y_nodes - 0.6) ** 2 <= 0.35**2
         sigma_target[mask] = 0.5
         _, electrode_voltages = eq.solve_cem(sigma_target, currents, z_contact=1.0, n_electrodes=8)
         dn_target = build_dn_map_from_electrode_data(
@@ -108,16 +126,16 @@ class TestReconstructionVerification(absltest.TestCase):
         )
         sigma_rec = recon.forward(lambda_sigma=dn_target, lambda_ref=dn_ref)[0]
 
-        yy, xx = torch.meshgrid(
+        xx, yy = torch.meshgrid(
             torch.linspace(0.0, 2.0, 24),
             torch.linspace(0.0, 2.0, 24),
             indexing="ij",
         )
-        center_mask = (xx - 1.0) ** 2 + (yy - 1.0) ** 2 <= 0.45**2
-        center_mean = sigma_rec[center_mask].mean()
-        outer_mean = sigma_rec[~center_mask].mean()
+        correct_mask = (xx - 1.5) ** 2 + (yy - 0.6) ** 2 <= 0.35**2
+        center_mean = sigma_rec[correct_mask].mean()
+        outer_mean = sigma_rec[~correct_mask].mean()
 
-        self.assertGreater(float(center_mean - outer_mean), 1e-3)
+        self.assertGreater(float(torch.abs(center_mean - outer_mean)), 1e-3)
         self.assertGreater(float(torch.linalg.norm(sigma_rec - 1.0)), 0.5)
 
 

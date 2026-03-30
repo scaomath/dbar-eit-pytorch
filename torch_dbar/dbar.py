@@ -28,12 +28,13 @@ from __future__ import annotations
 import math
 import warnings
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from linear_operator import LinearOperator as _BaseLinearOperator
 
 __all__ = [
+    "DBOperator",
     "make_square_trig_mode_indices",
     "arc_length_params_square",
     "square_boundary_points_from_angles",
@@ -69,6 +70,12 @@ def _normalize_square_domain_size(domain_size: float | tuple[float, float]) -> t
     return float(domain_size[0]), float(domain_size[1])
 
 
+def _default_square_electrode_data_scale(n_electrodes: int) -> float:
+    if n_electrodes < 1:
+        raise ValueError(f"n_electrodes must be positive, got {n_electrodes}.")
+    return math.pi / float(n_electrodes)
+
+
 def make_square_trig_mode_indices(
     n_electrodes: int,
     *,
@@ -94,6 +101,10 @@ def arc_length_params_square(
     device: torch.device | None = None,
     dtype: torch.dtype = torch.float64,
 ) -> tuple[torch.Tensor, float, torch.Tensor]:
+    r"""
+    fii: n_boundary_samples sample points around the boundary
+    Dfii = 2\pi / n_boundary_samples: the quadrature step size
+    """
     if n_boundary_samples < n_electrodes:
         raise ValueError(
             f"n_boundary_samples must be >= n_electrodes, got {n_boundary_samples} and {n_electrodes}."
@@ -194,9 +205,12 @@ def transform_adjacent_to_square_trig(
     *,
     domain_size: float | tuple[float, float] = 2.0,
     trig_mode_indices: torch.Tensor | None = None,
+    electrode_data_scale: float | None = None,
 ) -> torch.Tensor:
     voltages, squeeze = _as_batch_square_matrix(torch.as_tensor(electrode_voltages), "electrode_voltages")
     n_electrodes = voltages.shape[-1]
+    if electrode_data_scale is None:
+        electrode_data_scale = _default_square_electrode_data_scale(n_electrodes)
     real_dtype = torch.float64 if voltages.dtype in (torch.float64, torch.complex128) else torch.float32
     coeff, _, _ = _square_trig_current_basis(
         n_electrodes,
@@ -208,7 +222,7 @@ def transform_adjacent_to_square_trig(
 
     transformed = []
     for batch_idx in range(voltages.shape[0]):
-        U = voltages[batch_idx].to(dtype=_complex_dtype_from(voltages.dtype))
+        U = (electrode_data_scale * voltages[batch_idx]).to(dtype=_complex_dtype_from(voltages.dtype))
         U = U - U.mean(dim=0, keepdim=True)
         solution = torch.linalg.lstsq(
             coeff.transpose(0, 1).to(dtype=U.dtype),
@@ -256,11 +270,13 @@ def build_nd_map_from_electrode_data(
     domain_size: float | tuple[float, float] = 2.0,
     trig_mode_indices: torch.Tensor | None = None,
     n_boundary_samples: int = 512,
+    electrode_data_scale: float | None = None,
 ) -> torch.Tensor:
     trig_voltages = transform_adjacent_to_square_trig(
         electrode_voltages,
         domain_size=domain_size,
         trig_mode_indices=trig_mode_indices,
+        electrode_data_scale=electrode_data_scale,
     )
     if trig_voltages.dim() == 2:
         trig_voltages = trig_voltages.unsqueeze(0)
@@ -308,12 +324,14 @@ def build_dn_map_from_electrode_data(
     n_boundary_samples: int = 512,
     regularization: float = 1e-6,
     rcond: float | None = None,
+    electrode_data_scale: float | None = None,
 ) -> torch.Tensor:
     nd_map = build_nd_map_from_electrode_data(
         electrode_voltages,
         domain_size=domain_size,
         trig_mode_indices=trig_mode_indices,
         n_boundary_samples=n_boundary_samples,
+        electrode_data_scale=electrode_data_scale,
     )
     return nd_to_dn_map(nd_map, regularization=regularization, rcond=rcond)
 
@@ -612,6 +630,157 @@ def _interp_cubic_scattered(
     return output
 
 
+def _require_torch_dbar() -> None:
+    return None
+
+
+class DBOperator(_BaseLinearOperator):
+    def _init_state(
+        self,
+        *,
+        fundfft: torch.Tensor,
+        tr: torch.Tensor,
+        rind: torch.Tensor,
+        nind: int,
+        h: float | torch.Tensor,
+    ) -> None:
+        self.fundfft = torch.as_tensor(fundfft)
+        self.tr = torch.as_tensor(tr, device=self.fundfft.device, dtype=self.fundfft.dtype)
+        self.rind = torch.as_tensor(rind, device=self.fundfft.device, dtype=torch.bool)
+        self.nind = int(nind)
+        self.h = torch.as_tensor(h, device=self.fundfft.device, dtype=self.fundfft.real.dtype)
+        self._shape = torch.Size((2 * self.nind, 2 * self.nind))
+
+    def _size(self) -> torch.Size:
+        return self._shape
+
+    def _transpose_nonbatch(self) -> "DBOperator":
+        return self
+
+    def centered_convolution(self, values: torch.Tensor) -> torch.Tensor:
+        shifted = torch.fft.fftshift(values, dim=(-2, -1))
+        transformed = torch.fft.fft2(shifted, dim=(-2, -1))
+        conv = torch.fft.ifft2(self.fundfft * transformed, dim=(-2, -1))
+        return (self.h.square()) * torch.fft.ifftshift(conv, dim=(-2, -1))
+
+    def db_oper_real(self, w_vec: torch.Tensor) -> torch.Tensor:
+        real_vec = torch.as_tensor(w_vec, device=self.fundfft.device, dtype=self.fundfft.real.dtype)
+        if real_vec.dim() != 1:
+            raise ValueError(f"w_vec must be one-dimensional, got shape {tuple(real_vec.shape)}.")
+        if real_vec.numel() != 2 * self.nind:
+            raise ValueError(
+                f"w_vec must have length {2 * self.nind}, got {real_vec.numel()}."
+            )
+
+        w = torch.zeros_like(self.tr)
+        w[self.rind] = torch.complex(real_vec[: self.nind], real_vec[self.nind :])
+        conv = self.centered_convolution(self.tr * torch.conj(w))
+        out = w - conv
+        return torch.cat((out.real[self.rind], out.imag[self.rind]), dim=0)
+
+    def _matmul(self, rhs: torch.Tensor) -> torch.Tensor:
+        rhs = torch.as_tensor(rhs, device=self.fundfft.device, dtype=self.fundfft.real.dtype)
+        if rhs.dim() == 1:
+            return self.db_oper_real(rhs)
+        if rhs.dim() == 2:
+            return torch.stack([self.db_oper_real(rhs[:, idx]) for idx in range(rhs.shape[-1])], dim=-1)
+        raise ValueError(f"rhs must have shape ({self._shape[-1]},) or ({self._shape[-1]}, C), got {tuple(rhs.shape)}.")
+
+    def matvec(self, rhs: torch.Tensor) -> torch.Tensor:
+        return self._matmul(rhs)
+
+    def __init__(
+        self,
+        *,
+        fundfft: torch.Tensor,
+        tr: torch.Tensor,
+        rind: torch.Tensor,
+        nind: int,
+        h: float | torch.Tensor,
+    ) -> None:
+        self._init_state(fundfft=fundfft, tr=tr, rind=rind, nind=nind, h=h)
+        super().__init__(fundfft=self.fundfft, tr=self.tr, rind=self.rind, nind=self.nind, h=self.h)
+
+
+def _torch_gmres(
+    operator: DBOperator,
+    rhs: torch.Tensor,
+    *,
+    x0: torch.Tensor | None = None,
+    restart: int = 50,
+    rtol: float = 1e-5,
+    atol: float = 0.0,
+    maxiter: int = 500,
+) -> tuple[torch.Tensor, int]:
+    if restart < 1:
+        raise ValueError(f"restart must be positive, got {restart}.")
+    if rtol <= 0:
+        raise ValueError(f"rtol must be positive, got {rtol}.")
+    if atol < 0:
+        raise ValueError(f"atol must be non-negative, got {atol}.")
+    if maxiter < 1:
+        raise ValueError(f"maxiter must be positive, got {maxiter}.")
+
+    rhs = torch.as_tensor(rhs, device=operator.fundfft.device, dtype=operator.fundfft.real.dtype)
+    if rhs.dim() != 1:
+        raise ValueError(f"rhs must be one-dimensional, got shape {tuple(rhs.shape)}.")
+
+    x = torch.zeros_like(rhs) if x0 is None else torch.as_tensor(x0, device=rhs.device, dtype=rhs.dtype).clone()
+    krylov_dim = min(restart, rhs.numel())
+    rhs_norm = torch.linalg.vector_norm(rhs)
+    tolerance = max(rtol * float(rhs_norm.item()), atol)
+    breakdown_tol = torch.finfo(rhs.dtype).eps
+
+    for _ in range(maxiter):
+        residual = rhs - operator.matvec(x)
+        beta = torch.linalg.vector_norm(residual)
+        if float(beta.item()) <= tolerance:
+            return x, 0
+
+        V = torch.zeros((rhs.numel(), krylov_dim + 1), device=rhs.device, dtype=rhs.dtype)
+        H = torch.zeros((krylov_dim + 1, krylov_dim), device=rhs.device, dtype=rhs.dtype)
+        V[:, 0] = residual / beta
+
+        best_x = x
+        best_residual = float(beta.item())
+        for j in range(krylov_dim):
+            w = operator.matvec(V[:, j])
+            for i in range(j + 1):
+                hij = torch.dot(V[:, i], w)
+                H[i, j] = hij
+                w = w - hij * V[:, i]
+
+            h_next = torch.linalg.vector_norm(w)
+            H[j + 1, j] = h_next
+
+            Hj = H[: j + 2, : j + 1]
+            e1 = torch.zeros(j + 2, device=rhs.device, dtype=rhs.dtype)
+            e1[0] = beta
+            y = torch.linalg.lstsq(Hj, e1).solution
+            x_candidate = x + V[:, : j + 1] @ y
+
+            candidate_residual = rhs - operator.matvec(x_candidate)
+            candidate_norm = torch.linalg.vector_norm(candidate_residual)
+            candidate_norm_value = float(candidate_norm.item())
+            if candidate_norm_value < best_residual:
+                best_residual = candidate_norm_value
+                best_x = x_candidate
+
+            if candidate_norm_value <= tolerance:
+                return x_candidate, 0
+
+            if float(h_next.item()) <= breakdown_tol:
+                x = best_x
+                break
+
+            V[:, j + 1] = w / h_next
+        else:
+            x = best_x
+            continue
+
+    return x, maxiter
+
+
 def make_trig_basis(
     n_boundary_nodes: int,
     n_modes: int,
@@ -675,6 +844,9 @@ def make_adjacent_current_patterns(
     device: torch.device | None = None,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
+    """
+    n_electrodes: total number of electrodes on the boundary (evenly spaced around the perimeter).
+    """
     patterns = torch.zeros((n_electrodes, n_electrodes), device=device, dtype=dtype)
     idx = torch.arange(n_electrodes, device=device)
     patterns[idx, idx] = amplitude
@@ -764,11 +936,30 @@ class DbarReconstruction2D(nn.Module):
         background_conductivity: float = 1.0,
         domain_shape: str = "circle",
         domain_size: float | tuple[float, float] = 2.0,
+        inverse_method: str = "born",
+        gmres_restart: int = 50,
+        gmres_rtol: float = 1e-5,
+        gmres_maxiter: int = 500,
     ) -> None:
         super().__init__()
         domain_shape = domain_shape.lower()
         if domain_shape not in {"circle", "square"}:
             raise ValueError(f"domain_shape must be 'circle' or 'square', got {domain_shape}.")
+        inverse_method = inverse_method.lower()
+        if inverse_method not in {"born", "dbar"}:
+            raise ValueError(
+                f"inverse_method must be 'born' or 'dbar', got {inverse_method}."
+            )
+        if inverse_method == "dbar" and domain_shape != "square":
+            raise ValueError("inverse_method='dbar' is currently supported only for domain_shape='square'.")
+        if gmres_restart < 1:
+            raise ValueError(f"gmres_restart must be positive, got {gmres_restart}.")
+        if gmres_rtol <= 0:
+            raise ValueError(f"gmres_rtol must be positive, got {gmres_rtol}.")
+        if gmres_maxiter < 1:
+            raise ValueError(f"gmres_maxiter must be positive, got {gmres_maxiter}.")
+        if inverse_method == "dbar":
+            _require_torch_dbar()
 
         self.image_size = image_size
         self.n_boundary_nodes = n_boundary_nodes
@@ -787,6 +978,10 @@ class DbarReconstruction2D(nn.Module):
         self.background_conductivity = background_conductivity  # retained for API compatibility
         self.domain_shape = domain_shape
         self.domain_size = domain_size
+        self.inverse_method = inverse_method
+        self.gmres_restart = gmres_restart
+        self.gmres_rtol = gmres_rtol
+        self.gmres_maxiter = gmres_maxiter
 
         if self.domain_shape == "square":
             if self.n_electrodes % 2 != 0:
@@ -818,7 +1013,8 @@ class DbarReconstruction2D(nn.Module):
             x_coords = torch.linspace(-1.0, 1.0, image_size)
             y_coords = x_coords
 
-        yy, xx = torch.meshgrid(y_coords, x_coords, indexing="ij")
+        # matching forward_solver's grid
+        xx, yy = torch.meshgrid(x_coords, y_coords, indexing="ij")
         z_grid = xx + 1j * yy
 
         kx = torch.linspace(-self.k_extent, self.k_extent, k_grid_size)
@@ -841,9 +1037,9 @@ class DbarReconstruction2D(nn.Module):
 
     def extra_repr(self) -> str:
         return (
-            f"domain_shape={self.domain_shape}, image_size={self.image_size}, n_boundary_nodes={self.n_boundary_nodes}, "
-            f"n_modes={self.n_modes}, domain_size={self.domain_size}, k_grid_size={self.k_grid_size}, "
-            f"k_radius={self.k_radius}, k_extent={self.k_extent}"
+            f"domain_shape={self.domain_shape}, inverse_method={self.inverse_method}, image_size={self.image_size}, "
+            f"n_boundary_nodes={self.n_boundary_nodes}, n_modes={self.n_modes}, domain_size={self.domain_size}, "
+            f"k_grid_size={self.k_grid_size}, k_radius={self.k_radius}, k_extent={self.k_extent}"
         )
 
     def compute_scattering_transform_square(
@@ -993,7 +1189,14 @@ class DbarReconstruction2D(nn.Module):
 
         return out[0] if squeeze else out
 
-    def solve_sigma(self, scattering_transform: torch.Tensor) -> torch.Tensor:
+    def _clamp_sigma(self, sigma: torch.Tensor) -> torch.Tensor:
+        if self.conductivity_min is not None:
+            sigma = sigma.clamp_min(self.conductivity_min)
+        if self.conductivity_max is not None:
+            sigma = sigma.clamp_max(self.conductivity_max)
+        return sigma.unsqueeze(1).to(dtype=self.z_grid.real.dtype)
+
+    def _solve_sigma_born(self, scattering_transform: torch.Tensor) -> torch.Tensor:
         """Approximate inverse step from scattering data to conductivity."""
         scattering_transform, squeeze = _as_batch_scattering_grid(
             scattering_transform,
@@ -1022,13 +1225,113 @@ class DbarReconstruction2D(nn.Module):
         mu0 = 1.0 + (self.dk.to(dtype=born.real.dtype) ** 2 / math.pi) * born
         sigma = mu0.abs().square().reshape(batch_size, self.image_size, self.image_size)
 
-        if self.conductivity_min is not None:
-            sigma = sigma.clamp_min(self.conductivity_min)
-        if self.conductivity_max is not None:
-            sigma = sigma.clamp_max(self.conductivity_max)
-
-        sigma = sigma.unsqueeze(1).to(dtype=self.z_grid.real.dtype)
+        sigma = self._clamp_sigma(sigma)
         return sigma[0] if squeeze else sigma
+
+    def _solve_sigma_dbar(self, scattering_transform: torch.Tensor) -> torch.Tensor:
+        """Solve the real-linear D-bar equation for mu(z, k) and reconstruct sigma(z)=|mu(z,0)|^2."""
+        _require_torch_dbar()
+
+        scattering_transform, squeeze = _as_batch_scattering_grid(
+            scattering_transform,
+            "scattering_transform",
+            self.k_grid_size,
+        )
+        if self.domain_shape != "square":
+            raise ValueError("inverse_method='dbar' is currently supported only for domain_shape='square'.")
+
+        complex_dtype = _complex_dtype_from(scattering_transform.dtype)
+        device = scattering_transform.device
+        real_dtype = torch.float64 if complex_dtype == torch.complex128 else torch.float32
+
+        k_grid = self.k_grid.to(device=device, dtype=complex_dtype)
+        rind = self.k_mask.to(device=device, dtype=torch.bool)
+        nind = int(rind.sum().item())
+        if nind == 0:
+            raise ValueError("The D-bar solve requires at least one k-grid point inside the truncation mask.")
+
+        ktmp = k_grid.clone()
+        ind0 = k_grid.abs() < 1e-14
+        if not torch.any(ind0):
+            ind0 = k_grid.abs() == k_grid.abs().min()
+        ktmp[ind0] = torch.ones_like(ktmp[ind0])
+
+        scatk_scale = torch.zeros_like(k_grid)
+        scatk_scale[rind] = 1.0 / torch.conj(ktmp[rind])
+        scatk_scale[ind0] = 0.0
+
+        fund = torch.zeros_like(k_grid)
+        fund[rind] = 1.0 / (math.pi * ktmp[rind])
+        fund[ind0] = 0.0
+
+        s = float(torch.abs(k_grid.real.min()).item())
+        ep = s / 10.0 if s > 0 else 0.0
+        rr = (s - ep) / 2.0 if s > 0 else 0.0
+        radius = k_grid.abs()
+        bigind = radius >= s
+        fund[bigind] = 0.0
+        if ep > 0:
+            medind = (radius < s) & (radius > 2.0 * rr)
+            fund[medind] *= 1.0 - (radius[medind] - 2.0 * rr) / ep
+
+        fundfft = torch.fft.fft2(torch.fft.fftshift(fund, dim=(-2, -1)), dim=(-2, -1))
+        rhs = torch.cat(
+            (
+                torch.ones(nind, device=device, dtype=real_dtype),
+                torch.zeros(nind, device=device, dtype=real_dtype),
+            )
+        )
+        z_flat = self.z_grid.to(device=device, dtype=complex_dtype).reshape(-1)
+        recon = torch.empty(
+            (scattering_transform.shape[0], z_flat.numel()),
+            device=device,
+            dtype=self.z_grid.real.dtype,
+        )
+
+        self_h = float(self.dk.item())
+        k_rind = k_grid[rind]
+        zero_idx = int(torch.argmin(torch.abs(k_rind)).item())
+        for batch_idx in range(scattering_transform.shape[0]):
+            scatk = scattering_transform[batch_idx].to(device=device, dtype=complex_dtype) * scatk_scale
+            scatk[ind0] = 0.0
+            iniguess = rhs.clone()
+            for z_idx, z in enumerate(z_flat):
+                tr = (1.0 / (4.0 * math.pi)) * scatk * torch.exp(
+                    -1j * (k_grid * z + torch.conj(k_grid * z))
+                )
+                operator = DBOperator(
+                    fundfft=fundfft,
+                    tr=tr,
+                    rind=rind,
+                    nind=nind,
+                    h=self_h,
+                )
+                solution, info = _torch_gmres(
+                    operator,
+                    rhs,
+                    x0=iniguess,
+                    restart=self.gmres_restart,
+                    rtol=self.gmres_rtol,
+                    atol=0.0,
+                    maxiter=self.gmres_maxiter,
+                )
+                if info != 0:
+                    raise RuntimeError(
+                        f"GMRES failed for batch {batch_idx} at spatial index {z_idx} with info={info}."
+                    )
+                iniguess = solution
+                mu_rind = torch.complex(solution[:nind], solution[nind:])
+                recon[batch_idx, z_idx] = mu_rind[zero_idx].abs().square().to(dtype=recon.dtype)
+
+        sigma = recon.to(device=self.z_grid.device, dtype=self.z_grid.real.dtype)
+        sigma = sigma.reshape(scattering_transform.shape[0], self.image_size, self.image_size)
+        sigma = self._clamp_sigma(sigma)
+        return sigma[0] if squeeze else sigma
+
+    def solve_sigma(self, scattering_transform: torch.Tensor) -> torch.Tensor:
+        if self.inverse_method == "born":
+            return self._solve_sigma_born(scattering_transform)
+        return self._solve_sigma_dbar(scattering_transform)
 
     def forward(
         self,

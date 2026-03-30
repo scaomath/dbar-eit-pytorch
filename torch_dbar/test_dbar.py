@@ -1,4 +1,5 @@
 from dbar import (
+    DBOperator,
     DbarReconstruction2D,
     _interp2_bicubic_rect_grid,
     _interp_cubic_scattered,
@@ -26,6 +27,34 @@ class TestDbarBoundary(parameterized.TestCase):
     def test_make_square_trig_mode_indices(self):
         expected = torch.tensor([1, 2, 3, 4, 3, 2, 1], dtype=torch.int64)
         torch.testing.assert_close(make_square_trig_mode_indices(8), expected)
+
+    def test_build_nd_map_uses_default_electrode_scale(self):
+        eq = DiffusionEquation2D(grid_size=16, domain_size=2.0, grid_type="node")
+        sigma = torch.ones((eq.Nx, eq.Ny), dtype=torch.float64)
+        currents = make_adjacent_current_patterns(8, dtype=torch.float64).transpose(0, 1)
+        _, electrode_voltages = eq.solve_cem(sigma, currents, z_contact=1.0, n_electrodes=8)
+        voltage_matrix = electrode_voltages.transpose(0, 1)
+
+        nd_default = build_nd_map_from_electrode_data(
+            voltage_matrix,
+            domain_size=2.0,
+            n_boundary_samples=128,
+        )
+        nd_manual = build_nd_map_from_electrode_data(
+            voltage_matrix,
+            domain_size=2.0,
+            n_boundary_samples=128,
+            electrode_data_scale=math.pi / 8.0,
+        )
+        nd_unscaled = build_nd_map_from_electrode_data(
+            voltage_matrix,
+            domain_size=2.0,
+            n_boundary_samples=128,
+            electrode_data_scale=1.0,
+        )
+
+        torch.testing.assert_close(nd_default, nd_manual, atol=1e-10, rtol=0.0)
+        torch.testing.assert_close(nd_default, (math.pi / 8.0) * nd_unscaled, atol=1e-10, rtol=1e-10)
 
     def test_arc_length_params_square(self):
         fii, Dfii, gamma_mid = arc_length_params_square(8, domain_size=2.0, n_boundary_samples=16)
@@ -132,6 +161,174 @@ class TestDbarCGO(absltest.TestCase):
 
 
 class TestDbarReconstruction(absltest.TestCase):
+    def test_db_operator_matches_numpy_fixture(self):
+        fund = torch.tensor(
+            [
+                [0.0 + 0.0j, 0.10 - 0.20j, 0.05 + 0.03j],
+                [0.07 + 0.01j, -0.02 + 0.04j, 0.11 - 0.06j],
+                [0.03 - 0.08j, 0.09 + 0.02j, -0.05 + 0.07j],
+            ],
+            dtype=torch.complex128,
+        )
+        fundfft = torch.fft.fft2(torch.fft.fftshift(fund, dim=(-2, -1)), dim=(-2, -1))
+        tr = torch.tensor(
+            [
+                [0.0 + 0.0j, 0.20 + 0.10j, -0.15 + 0.05j],
+                [0.04 - 0.07j, 0.00 + 0.00j, 0.12 + 0.03j],
+                [-0.05 + 0.02j, 0.08 - 0.04j, 0.00 + 0.00j],
+            ],
+            dtype=torch.complex128,
+        )
+        rind = torch.tensor(
+            [
+                [False, True, True],
+                [True, False, True],
+                [True, True, False],
+            ],
+            dtype=torch.bool,
+        )
+        w_vec = torch.tensor(
+            [0.4, -0.2, 0.1, 0.3, -0.5, 0.2, -0.1, 0.6, -0.4, 0.15, -0.35, 0.05],
+            dtype=torch.float64,
+        )
+        expected = torch.tensor(
+            [
+                0.40007125,
+                -0.19984469,
+                0.09888781,
+                0.29976594,
+                -0.50021594,
+                0.19952313,
+                -0.10080438,
+                0.60076687,
+                -0.39918594,
+                0.14930594,
+                -0.35069031,
+                0.05040531,
+            ],
+            dtype=torch.float64,
+        )
+
+        operator = DBOperator(
+            fundfft=fundfft,
+            tr=tr,
+            rind=rind,
+            nind=int(rind.sum().item()),
+            h=0.25,
+        )
+        actual = operator.matvec(w_vec)
+
+        torch.testing.assert_close(actual, expected, atol=1e-8, rtol=0.0)
+
+    def test_db_operator_supports_autograd(self):
+        fund = torch.tensor(
+            [
+                [0.0 + 0.0j, 0.10 - 0.20j, 0.05 + 0.03j],
+                [0.07 + 0.01j, -0.02 + 0.04j, 0.11 - 0.06j],
+                [0.03 - 0.08j, 0.09 + 0.02j, -0.05 + 0.07j],
+            ],
+            dtype=torch.complex128,
+        )
+        fundfft = torch.fft.fft2(torch.fft.fftshift(fund, dim=(-2, -1)), dim=(-2, -1))
+        tr = torch.tensor(
+            [
+                [0.0 + 0.0j, 0.20 + 0.10j, -0.15 + 0.05j],
+                [0.04 - 0.07j, 0.00 + 0.00j, 0.12 + 0.03j],
+                [-0.05 + 0.02j, 0.08 - 0.04j, 0.00 + 0.00j],
+            ],
+            dtype=torch.complex128,
+            requires_grad=True,
+        )
+        rind = torch.tensor(
+            [
+                [False, True, True],
+                [True, False, True],
+                [True, True, False],
+            ],
+            dtype=torch.bool,
+        )
+        w_vec = torch.tensor(
+            [0.4, -0.2, 0.1, 0.3, -0.5, 0.2, -0.1, 0.6, -0.4, 0.15, -0.35, 0.05],
+            dtype=torch.float64,
+        )
+
+        operator = DBOperator(
+            fundfft=fundfft,
+            tr=tr,
+            rind=rind,
+            nind=int(rind.sum().item()),
+            h=0.25,
+        )
+        loss = operator.matvec(w_vec).square().sum()
+        loss.backward()
+
+        self.assertIsNotNone(tr.grad)
+        grad = tr.grad
+        assert grad is not None
+        self.assertTrue(torch.isfinite(grad).all().item())
+
+    def test_db_operator_cuda_smoke(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is not available.")
+
+        device = torch.device("cuda")
+        fund = torch.tensor(
+            [
+                [0.0 + 0.0j, 0.10 - 0.20j, 0.05 + 0.03j],
+                [0.07 + 0.01j, -0.02 + 0.04j, 0.11 - 0.06j],
+                [0.03 - 0.08j, 0.09 + 0.02j, -0.05 + 0.07j],
+            ],
+            dtype=torch.complex64,
+            device=device,
+        )
+        fundfft = torch.fft.fft2(torch.fft.fftshift(fund, dim=(-2, -1)), dim=(-2, -1))
+        tr = torch.tensor(
+            [
+                [0.0 + 0.0j, 0.20 + 0.10j, -0.15 + 0.05j],
+                [0.04 - 0.07j, 0.00 + 0.00j, 0.12 + 0.03j],
+                [-0.05 + 0.02j, 0.08 - 0.04j, 0.00 + 0.00j],
+            ],
+            dtype=torch.complex64,
+            device=device,
+        )
+        rind = torch.tensor(
+            [
+                [False, True, True],
+                [True, False, True],
+                [True, True, False],
+            ],
+            dtype=torch.bool,
+            device=device,
+        )
+        w_vec = torch.tensor(
+            [0.4, -0.2, 0.1, 0.3, -0.5, 0.2, -0.1, 0.6, -0.4, 0.15, -0.35, 0.05],
+            dtype=torch.float32,
+            device=device,
+        )
+
+        operator = DBOperator(
+            fundfft=fundfft,
+            tr=tr,
+            rind=rind,
+            nind=int(rind.sum().item()),
+            h=0.25,
+        )
+        actual = operator.matvec(w_vec)
+
+        self.assertEqual(actual.device.type, "cuda")
+        self.assertTrue(torch.isfinite(actual).all().item())
+
+    def test_dbar_inverse_requires_square_domain(self):
+        with self.assertRaisesRegex(ValueError, "supported only for domain_shape='square'"):
+            DbarReconstruction2D(
+                image_size=8,
+                n_boundary_nodes=16,
+                n_modes=3,
+                k_grid_size=9,
+                k_radius=2.0,
+                inverse_method="dbar",
+            )
+
     def test_interp2_bicubic_rect_grid_matches_grid_nodes(self):
         x = torch.linspace(-1.0, 1.0, 9, dtype=torch.float64)
         y = torch.linspace(-1.5, 1.5, 7, dtype=torch.float64)
@@ -204,6 +401,32 @@ class TestDbarReconstruction(absltest.TestCase):
         self.assertEqual(sigma_rec.shape, (1, 16, 16))
         torch.testing.assert_close(sigma_rec, torch.ones_like(sigma_rec), atol=1e-10, rtol=0.0)
 
+    def test_forward_square_zero_scattering_returns_ones_with_dbar_inverse(self):
+        eq = DiffusionEquation2D(grid_size=12, domain_size=2.0, grid_type="node")
+        sigma = torch.ones((eq.Nx, eq.Ny), dtype=torch.float64)
+        currents = make_adjacent_current_patterns(8, dtype=torch.float64).transpose(0, 1)
+        _, electrode_voltages = eq.solve_cem(sigma, currents, z_contact=1.0, n_electrodes=8)
+        voltage_matrix = electrode_voltages.transpose(0, 1)
+        dn_map = build_dn_map_from_electrode_data(voltage_matrix, domain_size=2.0, n_boundary_samples=64)
+
+        recon = DbarReconstruction2D(
+            image_size=8,
+            n_boundary_nodes=64,
+            n_modes=7,
+            n_electrodes=8,
+            k_grid_size=9,
+            k_radius=2.0,
+            domain_shape="square",
+            domain_size=2.0,
+            inverse_method="dbar",
+            gmres_restart=10,
+            gmres_rtol=1e-10,
+            gmres_maxiter=10,
+        )
+        sigma_rec = recon.forward(lambda_sigma=dn_map, lambda_ref=dn_map)
+        self.assertEqual(sigma_rec.shape, (1, 8, 8))
+        torch.testing.assert_close(sigma_rec, torch.ones_like(sigma_rec), atol=1e-8, rtol=0.0)
+
     def test_square_reconstruction_grid_matches_domain_size(self):
         recon = DbarReconstruction2D(
             image_size=16,
@@ -218,9 +441,9 @@ class TestDbarReconstruction(absltest.TestCase):
         z_grid = torch.as_tensor(recon.z_grid)
 
         torch.testing.assert_close(z_grid.real[0, 0], torch.tensor(0.0, dtype=z_grid.real.dtype), atol=0.0, rtol=0.0)
-        torch.testing.assert_close(z_grid.real[0, -1], torch.tensor(1.0, dtype=z_grid.real.dtype), atol=1e-12, rtol=0.0)
+        torch.testing.assert_close(z_grid.real[-1, 0], torch.tensor(1.0, dtype=z_grid.real.dtype), atol=1e-12, rtol=0.0)
         torch.testing.assert_close(z_grid.imag[0, 0], torch.tensor(0.0, dtype=z_grid.imag.dtype), atol=0.0, rtol=0.0)
-        torch.testing.assert_close(z_grid.imag[-1, 0], torch.tensor(math.pi, dtype=z_grid.imag.dtype), atol=1e-12, rtol=0.0)
+        torch.testing.assert_close(z_grid.imag[0, -1], torch.tensor(math.pi, dtype=z_grid.imag.dtype), atol=1e-12, rtol=0.0)
 
     def test_forward_from_measurements_square_zero_scattering_returns_ones(self):
         eq = DiffusionEquation2D(grid_size=32, domain_size=2.0, grid_type="node")

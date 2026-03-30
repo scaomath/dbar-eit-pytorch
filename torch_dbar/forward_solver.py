@@ -14,6 +14,29 @@ def electrode_builder_square(
     dtype: torch.dtype = torch.float64,
     device: torch.device | None = None,
 ) -> torch.Tensor:
+    r"""Build equally sized electrode arcs on the boundary of a square domain.
+
+    The electrodes are parameterized by arc length along the perimeter,
+    starting at 0 and proceeding counterclockwise. The result stores the
+    start and end arc coordinate for each electrode.
+
+    Parameters
+    ----------
+    n_electrodes : int
+        Number of electrodes on the boundary.
+    domain_size : float or tuple of float, default=1.0
+        Side length for a square domain, or (Lx, Ly) for a rectangle.
+    dtype : torch.dtype, default=torch.float64
+        Tensor dtype for the returned electrode intervals.
+    device : torch.device or None, default=None
+        Device on which to allocate the result.
+
+    Returns
+    -------
+    electrodes : torch.Tensor
+        Tensor of shape (n_electrodes, 2). Each row contains the start and end
+        arc-length coordinate of one electrode.
+    """
     if n_electrodes < 1:
         raise ValueError(f"n_electrodes must be positive, got {n_electrodes}.")
 
@@ -34,6 +57,30 @@ def make_adjacent_current_patterns(
     dtype: torch.dtype = torch.float64,
     device: torch.device | None = None,
 ) -> torch.Tensor:
+    r"""Construct adjacent current-injection patterns for boundary electrodes.
+
+    Column: one pattern. 
+    Electrode j injects the specified
+    amplitude and electrode j+1 mod n_electrodes withdraws the same amount,
+    so every pattern has zero net current.
+
+    Parameters
+    ----------
+    n_electrodes : int
+        Number of electrodes.
+    amplitude : float, default=1.0
+        Magnitude of the injected and withdrawn current.
+    dtype : torch.dtype, default=torch.float64
+        Tensor dtype for the returned pattern matrix.
+    device : torch.device or None, default=None
+        Device on which to allocate the result.
+
+    Returns
+    -------
+    patterns : torch.Tensor
+        Tensor of shape (n_electrodes, n_electrodes). Column j is the j-th
+        adjacent current pattern.
+    """
     patterns = torch.zeros((n_electrodes, n_electrodes), dtype=dtype, device=device)
     idx = torch.arange(n_electrodes, device=device)
     patterns[idx, idx] = amplitude
@@ -42,6 +89,9 @@ def make_adjacent_current_patterns(
 
 
 class DiffusionEquation2D(nn.Module):
+    """
+    Finite-difference solver for the 2D diffusion equation with Dirichlet boundary and evaluates the diffusion op.
+    """
     def __init__(
         self,
         grid_size: Union[int, Tuple[int, int]],
@@ -196,6 +246,21 @@ class DiffusionEquation2D(nn.Module):
         return torch.linalg.solve(A_dense, rhs)
 
     def _normalize_contact_impedance(self, z_contact, n_electrodes: int) -> torch.Tensor:
+        r"""Convert contact impedance data to a validated per-electrode tensor.
+
+        Parameters
+        ----------
+        z_contact : float or torch.Tensor
+            Scalar contact impedance applied to every electrode, or a tensor of
+            shape (n_electrodes,) with one value per electrode.
+        n_electrodes : int
+            Number of electrodes expected by the current CEM system.
+
+        Returns
+        -------
+        z : torch.Tensor
+            Tensor of shape (n_electrodes,) on the solver device.
+        """
         device = self.x_nodes.device
         if isinstance(z_contact, torch.Tensor):
             z = z_contact.to(device=device, dtype=self.dtype)
@@ -282,6 +347,33 @@ class DiffusionEquation2D(nn.Module):
         n_electrodes: int,
         z_contact=1.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        r"""Assemble the dense linear system blocks for the complete electrode model.
+
+        The returned blocks define the coupled interior-electrode system used by
+        solve_cem. The conductivity field enters through the interior stiffness
+        matrix, while the electrode contact impedance contributes the boundary
+        coupling terms.
+
+        Parameters
+        ----------
+        sigma : torch.Tensor
+            Conductivity field on the solver grid.
+        n_electrodes : int
+            Number of boundary electrodes.
+        z_contact : float or torch.Tensor, default=1.0
+            Contact impedance, either shared by all electrodes or specified per
+            electrode.
+
+        Returns
+        -------
+        A : torch.Tensor
+            Interior stiffness matrix of shape (M, M).
+        C : torch.Tensor
+            Coupling matrix from electrode potentials to interior equations,
+            shape (M, n_electrodes).
+        D : torch.Tensor
+            Electrode mass-like matrix of shape (n_electrodes, n_electrodes).
+        """
         if self.Nx_int < 1 or self.Ny_int < 1:
             raise ValueError("CEM requires at least one interior node in each direction.")
 
@@ -354,6 +446,35 @@ class DiffusionEquation2D(nn.Module):
         z_contact=1.0,
         n_electrodes: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        r"""Solve the complete electrode model for one or more current patterns.
+
+        The method solves for both the nodal potential field inside the domain
+        and the electrode voltages consistent with the supplied boundary current
+        patterns.
+
+        Parameters
+        ----------
+        sigma : torch.Tensor
+            Conductivity field on the solver grid.
+        currents : torch.Tensor
+            Applied electrode currents with shape (L,) for one pattern or
+            (P, L) for P patterns over L electrodes. Each pattern must sum to
+            zero.
+        z_contact : float or torch.Tensor, default=1.0
+            Contact impedance, either shared by all electrodes or specified per
+            electrode.
+        n_electrodes : int or None, default=None
+            Number of electrodes. If omitted, it is inferred from currents.
+
+        Returns
+        -------
+        u : torch.Tensor
+            Domain potential on the full nodal grid. Shape is (Nx, Ny) for a
+            single pattern or (P, Nx, Ny) for multiple patterns.
+        electrode_potentials : torch.Tensor
+            Electrode voltages with shape (L,) for a single pattern or
+            (P, L) for multiple patterns.
+        """
         currents = torch.as_tensor(currents, dtype=self.dtype, device=self.x_nodes.device)
         squeeze = currents.dim() == 1
         if squeeze:
@@ -429,6 +550,25 @@ class DiffusionEquation2D(nn.Module):
         return u, electrode_potentials
 
     def solve(self, sigma, f=None, bc=None, bc_type="dirichlet"):
+        r"""Solve the interior diffusion problem with prescribed boundary values.
+
+        Parameters
+        ----------
+        sigma : torch.Tensor
+            Conductivity field on the solver grid.
+        f : torch.Tensor or None, default=None
+            Source term on the nodal grid. If omitted, a zero source is used.
+        bc : callable, tuple, or torch.Tensor
+            Boundary data accepted by _parse_bc.
+        bc_type : str, default="dirichlet"
+            Boundary-condition label. The current implementation treats the
+            problem as Dirichlet data.
+
+        Returns
+        -------
+        u : torch.Tensor
+            Nodal solution on the full grid, including boundary values.
+        """
         g_bnd = self._parse_bc(bc)
         A_II, _ = self.assemble_stiffness(sigma)
         
@@ -461,7 +601,7 @@ class DiffusionEquation2D(nn.Module):
     def get_flux(
         self, sigma: torch.Tensor, u: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        r"""Compute the flux field :math:`\mathbf{F} = -\sigma \nabla u` on staggered face grids.
+        r"""Compute the flux field \mathbf{F} = -\sigma \nabla u on staggered face grids.
 
         The two components are sampled on staggered faces between consecutive
         nodes:
@@ -521,10 +661,10 @@ class DiffusionEquation2D(nn.Module):
         return Fx, Fy
 
     def get_div(self, flux: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
-        r"""Compute :math:`\nabla \cdot \mathbf{F}` at every interior node.
+        r"""Compute `\nabla \cdot \mathbf{F}` at every interior node.
 
         The flux tuple is expected on the staggered face grids produced by
-        :meth:`get_flux`:
+         `get_flux`:
 
         * Fx — (Nx_int+1, Ny_int)
         * Fy — (Nx_int, Ny_int+1)
@@ -555,25 +695,24 @@ class DiffusionEquation2D(nn.Module):
         return result
 
     def forward(self, sigma: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
-        r"""Apply the diffusion operator :math:`-\nabla \cdot (\sigma \nabla u)` at every interior node.
+        r"""Apply the diffusion operator -\nabla \cdot (\sigma \nabla u) at every interior node.
 
-        Implemented as :math:`\nabla \cdot \mathbf{F}` where
-        :math:`\mathbf{F} = -\sigma \nabla u` is computed by :meth:`get_flux`
-        and the divergence is taken by :meth:`get_div`.
+        Implemented as \nabla \cdot \mathbf{F} where
+        \mathbf{F} = -\sigma \nabla u is computed by get_flux()
+        and the divergence is taken by get_div().
 
         Parameters
         ----------
         sigma : torch.Tensor
-            Conductivity field.  Shape ``(Nx, Ny)`` for ``grid_type="node"``
-            or ``(Nx-1, Ny-1)`` for ``grid_type="staggered"``.
+            Conductivity field.  Shape (Nx, Ny) for grid_type="node"
+            or (Nx-1, Ny-1) for grid_type="staggered".
         u : torch.Tensor
-            Full nodal solution, shape ``(Nx, Ny)``, including boundary values.
+            Full nodal solution, shape (Nx, Ny), including boundary values.
 
         Returns
         -------
-        result : torch.Tensor
-            ``(Nx, Ny)`` tensor; interior entries hold
-            :math:`-\nabla \cdot (\sigma \nabla u)`, boundary entries are zero.
+        result : (Nx, Ny) torch.Tensor; interior entries hold
+            -\nabla \cdot (\sigma \nabla u), boundary entries are zero.
         """
         return self.get_div(self.get_flux(sigma, u))
 
@@ -586,6 +725,29 @@ class DiffusionEquation2D(nn.Module):
         current_patterns: torch.Tensor | None = None,
         rcond: float = 1e-6,
     ) -> torch.Tensor:
+        r"""Build an electrode-level Neumann-to-Dirichlet map from CEM solves.
+
+        Parameters
+        ----------
+        sigma : torch.Tensor
+            Conductivity field on the solver grid.
+        n_electrodes : int, default=16
+            Number of electrodes.
+        z_contact : float or torch.Tensor, default=1.0
+            Contact impedance, either shared by all electrodes or specified per
+            electrode.
+        current_patterns : torch.Tensor or None, default=None
+            Matrix of electrode current patterns. If omitted, adjacent current
+            patterns are used.
+        rcond : float, default=1e-6
+            Relative cutoff passed to the pseudoinverse computation.
+
+        Returns
+        -------
+        nd_map : torch.Tensor
+            Symmetric electrode Neumann-to-Dirichlet map of shape
+            (n_electrodes, n_electrodes).
+        """
         if current_patterns is None:
             current_matrix = make_adjacent_current_patterns(
                 n_electrodes,
@@ -633,6 +795,32 @@ class DiffusionEquation2D(nn.Module):
         current_patterns: torch.Tensor | None = None,
         rcond: float = 1e-6,
     ) -> torch.Tensor:
+        r"""Build an electrode-level Dirichlet-to-Neumann map from the ND map.
+
+        This method forms the Neumann-to-Dirichlet map and then computes its
+        pseudoinverse to obtain the corresponding Dirichlet-to-Neumann map on
+        the electrode space.
+
+        Parameters
+        ----------
+        sigma : torch.Tensor
+            Conductivity field on the solver grid.
+        n_electrodes : int, default=16
+            Number of electrodes.
+        z_contact : float or torch.Tensor, default=1.0
+            Contact impedance, either shared by all electrodes or specified per
+            electrode.
+        current_patterns : torch.Tensor or None, default=None
+            Matrix of electrode current patterns used to build the ND map.
+        rcond : float, default=1e-6
+            Relative cutoff passed to the pseudoinverse computation.
+
+        Returns
+        -------
+        dn_map : torch.Tensor
+            Symmetric electrode Dirichlet-to-Neumann map of shape
+            (n_electrodes, n_electrodes).
+        """
         nd_map = self.neumann_to_dirichlet(
             sigma,
             n_electrodes=n_electrodes,
