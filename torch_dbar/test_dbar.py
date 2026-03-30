@@ -165,7 +165,10 @@ class TestDbarCGO(absltest.TestCase):
 
 
 class TestDbarReconstruction(absltest.TestCase):
-    def test_db_operator_matches_numpy_fixture(self):
+    def test_db_operator_matches_reference_formula(self):
+        """
+        Reference: DB_oper.m
+        """
         fund = torch.tensor(
             [
                 [0.0 + 0.0j, 0.10 - 0.20j, 0.05 + 0.03j],
@@ -195,34 +198,24 @@ class TestDbarReconstruction(absltest.TestCase):
             [0.4, -0.2, 0.1, 0.3, -0.5, 0.2, -0.1, 0.6, -0.4, 0.15, -0.35, 0.05],
             dtype=torch.float64,
         )
-        expected = torch.tensor(
-            [
-                0.40007125,
-                -0.19984469,
-                0.09888781,
-                0.29976594,
-                -0.50021594,
-                0.19952313,
-                -0.10080438,
-                0.60076687,
-                -0.39918594,
-                0.14930594,
-                -0.35069031,
-                0.05040531,
-            ],
-            dtype=torch.float64,
-        )
+        nind = int(rind.sum().item())
+
+        wtmp = torch.zeros_like(tr)
+        wtmp[rind] = torch.complex(w_vec[:nind], w_vec[nind:])
+        transformed = torch.fft.fft2(torch.fft.fftshift(tr * torch.conj(wtmp), dim=(-2, -1)), dim=(-2, -1))
+        conv = (0.25 ** 2) * torch.fft.ifftshift(torch.fft.ifft2(fundfft * transformed, dim=(-2, -1)), dim=(-2, -1))
+        expected = torch.cat(((wtmp - conv).real[rind], (wtmp - conv).imag[rind]), dim=0)
 
         operator = DBOperator(
             fundfft=fundfft,
             tr=tr,
             rind=rind,
-            nind=int(rind.sum().item()),
+            nind=nind,
             h=0.25,
         )
         actual = operator.matvec(w_vec)
 
-        torch.testing.assert_close(actual, expected, atol=1e-8, rtol=0.0)
+        torch.testing.assert_close(actual, expected, atol=1e-12, rtol=0.0)
 
     def test_db_operator_supports_autograd(self):
         fund = torch.tensor(

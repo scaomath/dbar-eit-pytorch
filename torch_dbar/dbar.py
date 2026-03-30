@@ -1,26 +1,8 @@
-"""Approximate continuum D-bar utilities.
+"""Porting D-bar method to Python
 
-Port status versus the MATLAB KIT4 scripts:
-
-- comp02_ND_buildFromKIT4.m:
-  not exactly ported; replaced here by an algebraic ND estimate from current/voltage data.
-- comp03_DN_build.m:
-  not exactly ported; replaced here by a projected pseudoinverse ND->DN conversion.
-- comp04_psi_BIE.m:
-  not ported; no boundary integral equation for CGO solutions is solved here.
-- comp05_tBIE_psi.m:
-  not ported; the scattering transform is approximated directly from delta_lambda.
-- comp06_Dbarsolve.m:
-  only the interpolation of precomputed scattering data are ported here;
-  the final solve in this file remains a truncated Born-style approximation,
-  not the MATLAB real-linear GMRES D-bar solve.
-
-This module also does not use MATLAB-style intermediate files such as
-`data/KIT4_measurement.mat` or `data/reconstruction.mat`; it keeps the
-relevant quantities in memory.
-
-The current PyTorch path reconstructs on the full Cartesian square grid.
+The current PyTorch code reconstructs on the full Cartesian square grid.
 No unit-disk masking is applied.
+
 """
 
 from __future__ import annotations

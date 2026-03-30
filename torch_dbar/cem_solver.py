@@ -4,7 +4,7 @@ from typing import Tuple, Union
 import torch
 import torch.nn as nn
 
-from .forward_solver import DiffusionEquation2D
+from torch_dbar.forward_solver import DiffusionEquation2D
 
 
 def generate_electrodes(
@@ -91,8 +91,6 @@ def generate_adjacent_current_patterns(
 class CompleteElectrodeModel(nn.Module):
     def __init__(self, solver: DiffusionEquation2D, **kwargs):
         super().__init__()
-        if not isinstance(solver, DiffusionEquation2D):
-            raise TypeError("solver must be a DiffusionEquation2D instance.")
         if solver.Nx_int < 1 or solver.Ny_int < 1:
             raise ValueError("CEM requires at least one interior node in each direction.")
         self.solver = solver

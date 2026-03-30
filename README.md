@@ -21,5 +21,5 @@ You need to download the `KIT4_Dbar_recon.zip` data file from the official MATLA
 
 ## References
 Our implementation is based on the official implementation based on KIT4 dataset:  https://fips.fi/blog/the-d-bar-method-for-electrical-impedance-tomography-experimental-data/ and their [wiki page](https://wiki.helsinki.fi/xwiki/bin/view/mathstatHenkilokunta/Henkil%C3%B6t/Siltanen%2C%20Samuli/Inverse%20Problems%20Book%20Page/EIT%20with%20the%20D-bar%20method%3A%20discontinuous%20heart-and-lungs%20phantom/).
-The initial porting draft of the MATLAB code based on KIT4 on circular domain is done by GPT Codex 5.3 using VSCode Copilot. The `numpy`-based iterative method in https://github.com/eitcom/pyEIT is also used as a reference code.
+The initial porting draft of the MATLAB code based on KIT4 on circular domain is done by GPT 5.4 using VSCode Copilot. The `numpy`-based iterative method in https://github.com/eitcom/pyEIT is also used as a reference code.
 
