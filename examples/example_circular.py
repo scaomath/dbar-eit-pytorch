@@ -49,7 +49,8 @@ sigma_gt = sigma_ref.clone()
 mask = (eq.x_nodes - disk_center[0]) ** 2 + (eq.y_nodes - disk_center[1]) ** 2 <= disk_radius ** 2
 sigma_gt[mask] = disk_conductivity
 
-currents = generate_adjacent_current_patterns(n_electrodes, dtype=torch.float64).transpose(0, 1)
+current_patterns = generate_adjacent_current_patterns(n_electrodes, dtype=torch.float64)
+currents = current_patterns.transpose(0, 1)
 
 _, electrode_voltages_ref = bie.solve_cem(
     sigma_ref,
@@ -66,11 +67,13 @@ _, electrode_voltages_gt = bie.solve_cem(
 
 dn_ref = build_dn_map_from_electrode_data(
     electrode_voltages_ref.transpose(0, 1),
+    current_patterns=current_patterns,
     domain_size=domain_size,
     n_boundary_samples=n_boundary_samples,
 )
 dn_gt = build_dn_map_from_electrode_data(
     electrode_voltages_gt.transpose(0, 1),
+    current_patterns=current_patterns,
     domain_size=domain_size,
     n_boundary_samples=n_boundary_samples,
 )
@@ -206,6 +209,7 @@ def reconstruct_sigma(sigma):
     )
     dn_sigma = build_dn_map_from_electrode_data(
         electrode_voltages.transpose(0, 1),
+        current_patterns=current_patterns,
         domain_size=domain_size,
         n_boundary_samples=n_boundary_samples,
     )

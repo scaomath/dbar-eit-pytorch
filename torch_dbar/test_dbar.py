@@ -6,8 +6,8 @@ from dbar import (
     arc_length_params_square,
     build_dn_map_from_electrode_data,
     build_nd_map_from_electrode_data,
-    make_square_trig_mode_indices,
-    square_boundary_points_from_angles,
+    make_trig_mode_indices,
+    boundary_points_from_angles,
     compute_psi_BIE_square,
     compute_tBIE_square,
 )
@@ -27,7 +27,7 @@ class TestDbarBoundary(parameterized.TestCase):
     """
     def test_make_square_trig_mode_indices(self):
         expected = torch.tensor([1, 2, 3, 4, 3, 2, 1], dtype=torch.int64)
-        torch.testing.assert_close(make_square_trig_mode_indices(8), expected)
+        torch.testing.assert_close(make_trig_mode_indices(8), expected)
 
     def test_build_nd_map_uses_default_electrode_scale(self):
         eq = DiffusionEquation2D(grid_size=16, domain_size=2.0, grid_type="node")
@@ -122,13 +122,13 @@ class TestDbarCGO(absltest.TestCase):
             [0.0, math.pi / 2.0, math.pi, 3.0 * math.pi / 2.0],
             dtype=torch.float64,
         )
-        points = square_boundary_points_from_angles(theta, domain_size=2.0)
+        points = boundary_points_from_angles(theta, domain_size=2.0)
         expected = torch.tensor([0.0 + 0.0j, 2.0 + 0.0j, 2.0 + 2.0j, 0.0 + 2.0j], dtype=torch.complex128)
         torch.testing.assert_close(points, expected)
 
     def test_compute_psi_BIE_square_zero_k(self):
         theta_arc, Dtheta, _ = arc_length_params_square(8, domain_size=2.0, n_boundary_samples=128)
-        ntrig = make_square_trig_mode_indices(8)
+        ntrig = make_trig_mode_indices(8)
         fpsi = compute_psi_BIE_square(
             torch.tensor([0.0 + 0.0j], dtype=torch.complex128),
             theta_arc,
@@ -148,7 +148,7 @@ class TestDbarCGO(absltest.TestCase):
         dn_map = build_dn_map_from_electrode_data(voltage_matrix, domain_size=2.0, n_boundary_samples=128)
 
         theta_arc, Dtheta, _ = arc_length_params_square(8, domain_size=2.0, n_boundary_samples=128)
-        ntrig = make_square_trig_mode_indices(8)
+        ntrig = make_trig_mode_indices(8)
         kvec = torch.tensor([0.0 + 0.0j, 0.25 + 0.5j, -0.4 + 0.1j], dtype=torch.complex128)
         fpsi = compute_psi_BIE_square(kvec, theta_arc, ntrig, domain_size=2.0, Dtheta=Dtheta)
         tbie = compute_tBIE_square(

@@ -8,6 +8,7 @@ No unit-disk masking is applied.
 from __future__ import annotations
 
 import math
+import warnings
 
 import torch
 import torch.nn as nn
@@ -16,11 +17,10 @@ from linear_operator import LinearOperator as _BaseLinearOperator
 
 __all__ = [
     "DBOperator",
-    "make_trig_mode_indices",
+    "make_square_trig_mode_indices",
     "arc_length_params_square",
-    "boundary_points_from_angles",
+    "square_boundary_points_from_angles",
     "transform_adjacent_to_square_trig",
-    "estimate_electrode_nd_map",
     "build_nd_map_from_electrode_data",
     "build_dn_map_from_electrode_data",
     "compute_psi_BIE_square",
@@ -44,7 +44,7 @@ def _complex_dtype_from(dtype: torch.dtype) -> torch.dtype:
     raise TypeError(f"Unsupported dtype for complex conversion: {dtype}.")
 
 
-def get_domain_size(domain_size: float | tuple[float, float]) -> tuple[float, float]:
+def _normalize_square_domain_size(domain_size: float | tuple[float, float]) -> tuple[float, float]:
     if isinstance(domain_size, (float, int)):
         return float(domain_size), float(domain_size)
     if len(domain_size) != 2:
@@ -52,13 +52,13 @@ def get_domain_size(domain_size: float | tuple[float, float]) -> tuple[float, fl
     return float(domain_size[0]), float(domain_size[1])
 
 
-def _default_electrode_data_scale(n_electrodes: int) -> float:
+def _default_square_electrode_data_scale(n_electrodes: int) -> float:
     if n_electrodes < 1:
         raise ValueError(f"n_electrodes must be positive, got {n_electrodes}.")
     return math.pi / float(n_electrodes)
 
 
-def make_trig_mode_indices(
+def make_square_trig_mode_indices(
     n_electrodes: int,
     *,
     device: torch.device | None = None,
@@ -92,7 +92,7 @@ def arc_length_params_square(
             f"n_boundary_samples must be >= n_electrodes, got {n_boundary_samples} and {n_electrodes}."
         )
 
-    Lx, Ly = get_domain_size(domain_size)
+    Lx, Ly = _normalize_square_domain_size(domain_size)
     perimeter = 2.0 * (Lx + Ly)
     electrode_edges = torch.linspace(0.0, perimeter, n_electrodes + 1, device=device, dtype=dtype)
     electrode_mid = 0.5 * (electrode_edges[:-1] + electrode_edges[1:])
@@ -103,13 +103,13 @@ def arc_length_params_square(
     return fii, Dfii, gamma_mid
 
 
-def boundary_points_from_angles(
+def square_boundary_points_from_angles(
     theta_arc: torch.Tensor,
     *,
     domain_size: float | tuple[float, float] = 2.0,
 ) -> torch.Tensor:
     theta_arc = torch.as_tensor(theta_arc)
-    Lx, Ly = get_domain_size(domain_size)
+    Lx, Ly = _normalize_square_domain_size(domain_size)
     perimeter = 2.0 * (Lx + Ly)
     s = (theta_arc.to(dtype=torch.float64) / (2.0 * math.pi)) * perimeter
     s = torch.remainder(s, perimeter)
@@ -141,7 +141,7 @@ def boundary_points_from_angles(
     return z.to(device=theta_arc.device, dtype=_complex_dtype_from(theta_arc.dtype))
 
 
-def trig_current_basis(
+def _square_trig_current_basis(
     n_electrodes: int,
     *,
     domain_size: float | tuple[float, float] = 2.0,
@@ -150,12 +150,12 @@ def trig_current_basis(
     dtype: torch.dtype = torch.float64,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if trig_mode_indices is None:
-        trig_mode_indices = make_trig_mode_indices(n_electrodes, device=device)
+        trig_mode_indices = make_square_trig_mode_indices(n_electrodes, device=device)
     else:
         trig_mode_indices = torch.as_tensor(trig_mode_indices, device=device)
 
     trig_mode_indices = trig_mode_indices.to(device=device, dtype=dtype)
-    Lx, Ly = get_domain_size(domain_size)
+    Lx, Ly = _normalize_square_domain_size(domain_size)
     perimeter = 2.0 * (Lx + Ly)
     electrode_starts = torch.linspace(0.0, perimeter, n_electrodes + 1, device=device, dtype=dtype)[:-1]
     theta_start = (2.0 * math.pi / perimeter) * electrode_starts
@@ -182,140 +182,19 @@ def trig_current_basis(
     return coeff, atrig, trig_mode_indices.to(dtype=torch.int64)
 
 
-def coerce_current_patterns(
-    current_patterns: torch.Tensor,
-    *,
-    n_electrodes: int,
-    batch_size: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    patterns = torch.as_tensor(current_patterns, device=device, dtype=dtype)
-    if patterns.dim() == 2:
-        if patterns.shape[0] == n_electrodes:
-            patterns = patterns.unsqueeze(0)
-        elif patterns.shape[1] == n_electrodes:
-            patterns = patterns.transpose(0, 1).unsqueeze(0)
-        else:
-            raise ValueError(
-                f"current_patterns must have one axis of length {n_electrodes}, got {tuple(patterns.shape)}."
-            )
-    elif patterns.dim() == 3:
-        if patterns.shape[-2] == n_electrodes:
-            pass
-        elif patterns.shape[-1] == n_electrodes:
-            patterns = patterns.transpose(-1, -2)
-        else:
-            raise ValueError(
-                f"current_patterns must have one trailing axis of length {n_electrodes}, got {tuple(patterns.shape)}."
-            )
-    else:
-        raise ValueError(
-            f"current_patterns must have shape (L, P), (P, L), (B, L, P), or (B, P, L), got {tuple(patterns.shape)}."
-        )
-
-    if patterns.shape[0] == 1 and batch_size > 1:
-        patterns = patterns.expand(batch_size, -1, -1)
-    elif patterns.shape[0] != batch_size:
-        raise ValueError(
-            f"current_patterns batch dimension must be 1 or {batch_size}, got {patterns.shape[0]}."
-        )
-
-    return patterns
-
-
-def estimate_electrode_nd_map(
-    electrode_voltages: torch.Tensor,
-    *,
-    current_patterns: torch.Tensor,
-    regularization: float = 1e-6,
-    rcond: float | None = None,
-) -> torch.Tensor:
-    voltages, squeeze = _as_batch_measurements(torch.as_tensor(electrode_voltages), "electrode_voltages")
-    n_electrodes = voltages.shape[-2]
-    currents = coerce_current_patterns(
-        current_patterns,
-        n_electrodes=n_electrodes,
-        batch_size=voltages.shape[0],
-        device=voltages.device,
-        dtype=voltages.real.dtype if torch.is_complex(voltages) else voltages.dtype,
-    )
-
-    complex_dtype = _complex_dtype_from(torch.promote_types(voltages.dtype, currents.dtype))
-    voltages = voltages.to(dtype=complex_dtype)
-    currents = currents.to(dtype=complex_dtype)
-
-    nd_maps = []
-    for batch_idx in range(voltages.shape[0]):
-        I = currents[batch_idx]
-        V = voltages[batch_idx]
-
-        if I.shape != V.shape:
-            raise ValueError(
-                f"current_patterns and electrode_voltages must have the same electrode/pattern shape, got {tuple(I.shape)} and {tuple(V.shape)}."
-            )
-
-        V = V - V.mean(dim=0, keepdim=True)
-        norms = torch.linalg.vector_norm(I, dim=0)
-        if torch.any(norms <= 0):
-            raise ValueError("Each current pattern must have nonzero Euclidean norm.")
-
-        I_norm = I / norms.unsqueeze(0)
-        V_norm = V / norms.unsqueeze(0)
-
-        if rcond is None:
-            nd_map = V_norm @ torch.linalg.pinv(I_norm)
-        else:
-            nd_map = V_norm @ torch.linalg.pinv(I_norm, rcond=rcond)
-
-        projector = make_mean_free_projector(
-            n_electrodes,
-            device=nd_map.device,
-            dtype=nd_map.dtype,
-        )
-        nd_map = projector @ nd_map @ projector
-        nd_maps.append(0.5 * (nd_map + nd_map.transpose(-1, -2).conj()))
-
-    out = torch.stack(nd_maps, dim=0)
-    return out[0] if squeeze else out
-
-
 def transform_adjacent_to_square_trig(
     electrode_voltages: torch.Tensor,
     *,
-    current_patterns: torch.Tensor | None = None,
     domain_size: float | tuple[float, float] = 2.0,
     trig_mode_indices: torch.Tensor | None = None,
     electrode_data_scale: float | None = None,
-    regularization: float = 1e-6,
-    rcond: float | None = None,
 ) -> torch.Tensor:
-    voltages, squeeze = _as_batch_measurements(torch.as_tensor(electrode_voltages), "electrode_voltages")
-    n_electrodes = voltages.shape[-2]
-    real_dtype = torch.float64 if voltages.dtype in (torch.float64, torch.complex128) else torch.float32
-    _, atrig, _ = trig_current_basis(
-        n_electrodes,
-        domain_size=domain_size,
-        trig_mode_indices=trig_mode_indices,
-        device=voltages.device,
-        dtype=real_dtype,
-    )
-
-    if current_patterns is not None:
-        nd_map = estimate_electrode_nd_map(
-            voltages,
-            current_patterns=current_patterns,
-            regularization=regularization,
-            rcond=rcond,
-        )
-        nd_map, _ = _as_batch_square_matrix(nd_map, "nd_map")
-        atrig = atrig.to(device=nd_map.device, dtype=nd_map.dtype)
-        transformed = nd_map @ atrig.unsqueeze(0).expand(nd_map.shape[0], -1, -1)
-        return transformed[0] if squeeze else transformed
-
+    voltages, squeeze = _as_batch_square_matrix(torch.as_tensor(electrode_voltages), "electrode_voltages")
+    n_electrodes = voltages.shape[-1]
     if electrode_data_scale is None:
-        electrode_data_scale = _default_electrode_data_scale(n_electrodes)
-    coeff, _, _ = trig_current_basis(
+        electrode_data_scale = _default_square_electrode_data_scale(n_electrodes)
+    real_dtype = torch.float64 if voltages.dtype in (torch.float64, torch.complex128) else torch.float32
+    coeff, _, _ = _square_trig_current_basis(
         n_electrodes,
         domain_size=domain_size,
         trig_mode_indices=trig_mode_indices,
@@ -350,7 +229,7 @@ def _square_trace_from_trig_voltages(
     return trace - trace.mean(dim=0, keepdim=True)
 
 
-def trig_boundary_matrix(
+def _square_trig_boundary_matrix(
     trig_mode_indices: torch.Tensor,
     fii: torch.Tensor,
 ) -> torch.Tensor:
@@ -370,22 +249,16 @@ def trig_boundary_matrix(
 def build_nd_map_from_electrode_data(
     electrode_voltages: torch.Tensor,
     *,
-    current_patterns: torch.Tensor | None = None,
     domain_size: float | tuple[float, float] = 2.0,
     trig_mode_indices: torch.Tensor | None = None,
     n_boundary_samples: int = 512,
     electrode_data_scale: float | None = None,
-    regularization: float = 1e-6,
-    rcond: float | None = None,
 ) -> torch.Tensor:
     trig_voltages = transform_adjacent_to_square_trig(
         electrode_voltages,
-        current_patterns=current_patterns,
         domain_size=domain_size,
         trig_mode_indices=trig_mode_indices,
         electrode_data_scale=electrode_data_scale,
-        regularization=regularization,
-        rcond=rcond,
     )
     if trig_voltages.dim() == 2:
         trig_voltages = trig_voltages.unsqueeze(0)
@@ -406,11 +279,11 @@ def build_nd_map_from_electrode_data(
         dtype=trig_voltages.real.dtype,
     )
     if trig_mode_indices is None:
-        trig_mode_indices = make_trig_mode_indices(n_electrodes, device=trig_voltages.device)
+        trig_mode_indices = make_square_trig_mode_indices(n_electrodes, device=trig_voltages.device)
     else:
         trig_mode_indices = torch.as_tensor(trig_mode_indices, device=trig_voltages.device)
 
-    B = trig_boundary_matrix(trig_mode_indices, fii).to(dtype=trig_voltages.dtype)
+    B = _square_trig_boundary_matrix(trig_mode_indices, fii).to(dtype=trig_voltages.dtype)
     nd_maps = []
     for batch_idx in range(trig_voltages.shape[0]):
         trace = _square_trace_from_trig_voltages(
@@ -428,7 +301,6 @@ def build_nd_map_from_electrode_data(
 def build_dn_map_from_electrode_data(
     electrode_voltages: torch.Tensor,
     *,
-    current_patterns: torch.Tensor | None = None,
     domain_size: float | tuple[float, float] = 2.0,
     trig_mode_indices: torch.Tensor | None = None,
     n_boundary_samples: int = 512,
@@ -438,18 +310,15 @@ def build_dn_map_from_electrode_data(
 ) -> torch.Tensor:
     nd_map = build_nd_map_from_electrode_data(
         electrode_voltages,
-        current_patterns=current_patterns,
         domain_size=domain_size,
         trig_mode_indices=trig_mode_indices,
         n_boundary_samples=n_boundary_samples,
         electrode_data_scale=electrode_data_scale,
-        regularization=regularization,
-        rcond=rcond,
     )
     return nd_to_dn_map(nd_map, regularization=regularization, rcond=rcond)
 
 
-def trig_synthesis_matrix(
+def _square_trig_synthesis_matrix(
     trig_mode_indices: torch.Tensor,
     theta_arc: torch.Tensor,
 ) -> torch.Tensor:
@@ -488,7 +357,7 @@ def compute_psi_BIE_square(
             raise ValueError("Dtheta is required when theta_arc has fewer than two samples.")
         Dtheta = float(theta_arc[1] - theta_arc[0])
 
-    boundary_points = boundary_points_from_angles(theta_arc, domain_size=domain_size).to(dtype=complex_dtype)
+    boundary_points = square_boundary_points_from_angles(theta_arc, domain_size=domain_size).to(dtype=complex_dtype)
     phase = torch.exp(1j * boundary_points[:, None] * Kvec[None, :])
 
     n_basis = trig_mode_indices.numel()
@@ -524,7 +393,7 @@ def compute_tBIE_square(
     complex_dtype = _complex_dtype_from(torch.promote_types(Kvec.dtype, DN.dtype))
     real_dtype = torch.float64 if complex_dtype == torch.complex128 else torch.float32
     if trig_mode_indices is None:
-        trig_mode_indices = make_trig_mode_indices(DN.shape[-1] + 1, device=DN.device)
+        trig_mode_indices = make_square_trig_mode_indices(DN.shape[-1] + 1, device=DN.device)
     else:
         trig_mode_indices = torch.as_tensor(trig_mode_indices, device=DN.device)
 
@@ -538,11 +407,11 @@ def compute_tBIE_square(
             raise ValueError("Dtheta is required when theta_arc has fewer than two samples.")
         Dtheta = float(theta_arc[1] - theta_arc[0])
 
-    T_basis = trig_synthesis_matrix(trig_mode_indices, theta_arc).to(dtype=complex_dtype)
+    T_basis = _square_trig_synthesis_matrix(trig_mode_indices, theta_arc).to(dtype=complex_dtype)
     FLLpsi = (DN - DN1) @ Fpsi_BIE
     LLpsi = T_basis @ FLLpsi
 
-    boundary_points = boundary_points_from_angles(theta_arc, domain_size=domain_size).to(dtype=complex_dtype)
+    boundary_points = square_boundary_points_from_angles(theta_arc, domain_size=domain_size).to(dtype=complex_dtype)
     exp_phase = torch.exp(1j * torch.conj(Kvec)[None, :] * torch.conj(boundary_points)[:, None])
     return Dtheta * torch.einsum("ij,ij->j", exp_phase, LLpsi)
 
@@ -1108,8 +977,8 @@ class DbarReconstruction2D(nn.Module):
                 domain_size=domain_size,
                 n_boundary_samples=n_boundary_nodes,
             )
-            boundary_points = boundary_points_from_angles(theta, domain_size=domain_size)
-            trig_mode_indices = make_trig_mode_indices(self.n_electrodes)
+            boundary_points = square_boundary_points_from_angles(theta, domain_size=domain_size)
+            trig_mode_indices = make_square_trig_mode_indices(self.n_electrodes)
             lambda_ref = torch.zeros((self.n_modes, self.n_modes), dtype=torch.float32)
         else:
             boundary_weight = 2.0 * math.pi / float(n_boundary_nodes)
@@ -1119,7 +988,7 @@ class DbarReconstruction2D(nn.Module):
             lambda_ref = make_reference_dn_map(n_boundary_nodes=n_boundary_nodes, n_modes=n_modes)
 
         if self.domain_shape == "square":
-            Lx, Ly = get_domain_size(domain_size)
+            Lx, Ly = _normalize_square_domain_size(domain_size)
             x_coords = torch.linspace(0.0, Lx, image_size)
             y_coords = torch.linspace(0.0, Ly, image_size)
         else:
@@ -1497,28 +1366,26 @@ class DbarReconstruction2D(nn.Module):
         reference_voltages: torch.Tensor | None = None,
         regularization: float = 1e-6,
     ) -> torch.Tensor:
+        warnings.warn(
+            "forward_from_measurements() is not an exact port of MATLAB comp02-comp05; "
+            "it uses approximate ND/DN/scattering surrogates.",
+            stacklevel=2,
+        )
         if self.domain_shape == "square":
             if reference_voltages is None:
                 raise ValueError("Square-domain D-bar reconstruction requires reference_voltages.")
 
-            if reference_currents is None:
-                reference_currents = currents
-
             lambda_sigma = build_dn_map_from_electrode_data(
                 voltages,
-                current_patterns=currents,
                 domain_size=self.domain_size,
                 trig_mode_indices=self.trig_mode_indices,
                 n_boundary_samples=self.n_boundary_nodes,
-                regularization=regularization,
             )
             lambda_ref = build_dn_map_from_electrode_data(
                 reference_voltages,
-                current_patterns=reference_currents,
                 domain_size=self.domain_size,
                 trig_mode_indices=self.trig_mode_indices,
                 n_boundary_samples=self.n_boundary_nodes,
-                regularization=regularization,
             )
             return self.forward(lambda_sigma=lambda_sigma, lambda_ref=lambda_ref)
 
@@ -1535,4 +1402,3 @@ class DbarReconstruction2D(nn.Module):
             )
 
         return self.forward(lambda_sigma=lambda_sigma, lambda_ref=lambda_ref)
-
