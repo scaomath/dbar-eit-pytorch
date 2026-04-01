@@ -36,14 +36,6 @@ __all__ = [
 ]
 
 
-def _complex_dtype_from(dtype: torch.dtype) -> torch.dtype:
-    if dtype in (torch.float64, torch.complex128):
-        return torch.complex128
-    if dtype in (torch.float16, torch.bfloat16, torch.float32, torch.complex64):
-        return torch.complex64
-    raise TypeError(f"Unsupported dtype for complex conversion: {dtype}.")
-
-
 def get_domain_size(domain_size: float | tuple[float, float]) -> tuple[float, float]:
     if isinstance(domain_size, (float, int)):
         return float(domain_size), float(domain_size)
@@ -138,7 +130,7 @@ def boundary_points_from_angles(
 
     z.real = x
     z.imag = y
-    return z.to(device=theta_arc.device, dtype=_complex_dtype_from(theta_arc.dtype))
+    return z.to(device=theta_arc.device, dtype=torch.complex128)
 
 
 def trig_current_basis(
@@ -241,9 +233,9 @@ def estimate_electrode_nd_map(
         dtype=voltages.real.dtype if torch.is_complex(voltages) else voltages.dtype,
     )
 
-    complex_dtype = _complex_dtype_from(torch.promote_types(voltages.dtype, currents.dtype))
-    voltages = voltages.to(dtype=complex_dtype)
-    currents = currents.to(dtype=complex_dtype)
+    
+    voltages = voltages.to(dtype=torch.complex64)
+    currents = currents.to(dtype=torch.complex64)
 
     nd_maps = []
     for batch_idx in range(voltages.shape[0]):
@@ -292,13 +284,12 @@ def transform_adjacent_to_square_trig(
 ) -> torch.Tensor:
     voltages, squeeze = _as_batch_measurements(torch.as_tensor(electrode_voltages), "electrode_voltages")
     n_electrodes = voltages.shape[-2]
-    real_dtype = torch.float64 if voltages.dtype in (torch.float64, torch.complex128) else torch.float32
     _, atrig, _ = trig_current_basis(
         n_electrodes,
         domain_size=domain_size,
         trig_mode_indices=trig_mode_indices,
         device=voltages.device,
-        dtype=real_dtype,
+        dtype=torch.float32,
     )
 
     if current_patterns is not None:
@@ -320,12 +311,12 @@ def transform_adjacent_to_square_trig(
         domain_size=domain_size,
         trig_mode_indices=trig_mode_indices,
         device=voltages.device,
-        dtype=real_dtype,
+        dtype=torch.float32,
     )
 
     transformed = []
     for batch_idx in range(voltages.shape[0]):
-        U = (electrode_data_scale * voltages[batch_idx]).to(dtype=_complex_dtype_from(voltages.dtype))
+        U = (electrode_data_scale * voltages[batch_idx]).to(dtype=torch.complex128)
         U = U - U.mean(dim=0, keepdim=True)
         solution = torch.linalg.lstsq(
             coeff.transpose(0, 1).to(dtype=U.dtype),
@@ -477,31 +468,29 @@ def compute_psi_BIE_square(
     Kvec = torch.as_tensor(Kvec)
     theta_arc = torch.as_tensor(theta_arc, device=Kvec.device)
     trig_mode_indices = torch.as_tensor(trig_mode_indices, device=Kvec.device)
-    complex_dtype = _complex_dtype_from(Kvec.dtype)
-    real_dtype = torch.float64 if complex_dtype == torch.complex128 else torch.float32
 
-    theta_arc = theta_arc.to(dtype=real_dtype)
+    theta_arc = theta_arc.to(dtype=torch.float32)
     trig_mode_indices = trig_mode_indices.to(dtype=torch.int64)
-    Kvec = Kvec.to(dtype=complex_dtype)
+    Kvec = Kvec.to(dtype=torch.complex64)
     if Dtheta is None:
         if theta_arc.numel() < 2:
             raise ValueError("Dtheta is required when theta_arc has fewer than two samples.")
         Dtheta = float(theta_arc[1] - theta_arc[0])
 
-    boundary_points = boundary_points_from_angles(theta_arc, domain_size=domain_size).to(dtype=complex_dtype)
+    boundary_points = boundary_points_from_angles(theta_arc, domain_size=domain_size).to(dtype=torch.complex64)
     phase = torch.exp(1j * boundary_points[:, None] * Kvec[None, :])
 
     n_basis = trig_mode_indices.numel()
     split = (n_basis + 1) // 2
-    basis = torch.zeros((n_basis, theta_arc.numel()), dtype=real_dtype, device=theta_arc.device)
-    trig_mode_indices_real = trig_mode_indices.to(dtype=real_dtype)
+    basis = torch.zeros((n_basis, theta_arc.numel()), dtype=torch.float32, device=theta_arc.device)
+    trig_mode_indices_real = trig_mode_indices.to(dtype=torch.float32)
     for j in range(n_basis):
         if j < split:
             basis[j, :] = (1.0 / math.sqrt(math.pi)) * torch.cos(trig_mode_indices_real[j] * theta_arc)
         else:
             basis[j, :] = (1.0 / math.sqrt(math.pi)) * torch.sin(trig_mode_indices_real[j] * theta_arc)
 
-    return Dtheta * (basis.to(dtype=complex_dtype) @ phase)
+    return Dtheta * (basis.to(dtype=torch.complex64) @ phase)
 
 
 def compute_tBIE_square(
@@ -521,28 +510,27 @@ def compute_tBIE_square(
     Fpsi_BIE = torch.as_tensor(Fpsi_BIE, device=DN.device)
     theta_arc = torch.as_tensor(theta_arc, device=DN.device)
 
-    complex_dtype = _complex_dtype_from(torch.promote_types(Kvec.dtype, DN.dtype))
-    real_dtype = torch.float64 if complex_dtype == torch.complex128 else torch.float32
+    
     if trig_mode_indices is None:
         trig_mode_indices = make_trig_mode_indices(DN.shape[-1] + 1, device=DN.device)
     else:
         trig_mode_indices = torch.as_tensor(trig_mode_indices, device=DN.device)
 
-    Kvec = Kvec.to(dtype=complex_dtype, device=DN.device)
-    DN = DN.to(dtype=complex_dtype)
-    DN1 = DN1.to(dtype=complex_dtype)
-    Fpsi_BIE = Fpsi_BIE.to(dtype=complex_dtype)
-    theta_arc = theta_arc.to(dtype=real_dtype)
+    Kvec = Kvec.to(dtype=torch.complex64, device=DN.device)
+    DN = DN.to(dtype=torch.complex64)
+    DN1 = DN1.to(dtype=torch.complex64)
+    Fpsi_BIE = Fpsi_BIE.to(dtype=torch.complex64)
+    theta_arc = theta_arc.to(dtype=torch.float32)
     if Dtheta is None:
         if theta_arc.numel() < 2:
             raise ValueError("Dtheta is required when theta_arc has fewer than two samples.")
         Dtheta = float(theta_arc[1] - theta_arc[0])
 
-    T_basis = trig_synthesis_matrix(trig_mode_indices, theta_arc).to(dtype=complex_dtype)
+    T_basis = trig_synthesis_matrix(trig_mode_indices, theta_arc).to(dtype=torch.complex64)
     FLLpsi = (DN - DN1) @ Fpsi_BIE
     LLpsi = T_basis @ FLLpsi
 
-    boundary_points = boundary_points_from_angles(theta_arc, domain_size=domain_size).to(dtype=complex_dtype)
+    boundary_points = boundary_points_from_angles(theta_arc, domain_size=domain_size).to(dtype=torch.complex64)
     exp_phase = torch.exp(1j * torch.conj(Kvec)[None, :] * torch.conj(boundary_points)[:, None])
     return Dtheta * torch.einsum("ij,ij->j", exp_phase, LLpsi)
 
@@ -639,8 +627,8 @@ def _interp2_bicubic_rect_grid(
 ) -> torch.Tensor:
     x_coords, y_coords, values = _rect_grid_coords(K1, K2, values)
     values = values.to(device=x_coords.device)
-    complex_dtype = values.dtype if torch.is_complex(values) else _complex_dtype_from(values.dtype)
-    values = values.to(dtype=complex_dtype)
+    
+    values = values.to(dtype=torch.complex64)
     x_query = torch.as_tensor(x_query, device=x_coords.device, dtype=x_coords.dtype)
     y_query = torch.as_tensor(y_query, device=x_coords.device, dtype=y_coords.dtype)
 
@@ -667,7 +655,7 @@ def _interp2_bicubic_rect_grid(
         align_corners=True,
     )
     sampled = sampled.view(2, -1)
-    return torch.complex(sampled[0], sampled[1]).to(dtype=complex_dtype)
+    return torch.complex(sampled[0], sampled[1]).to(dtype=torch.complex64)
 
 
 def _interp_cubic_scattered(
@@ -688,8 +676,8 @@ def _interp_cubic_scattered(
         dim=-1,
     )
     values = torch.as_tensor(values, device=device).reshape(-1)
-    complex_dtype = values.dtype if torch.is_complex(values) else _complex_dtype_from(values.dtype)
-    values = values.to(dtype=complex_dtype)
+    
+    values = values.to(dtype=torch.complex64)
     query_points = torch.stack(
         (
             torch.as_tensor(y_query, device=device, dtype=torch.float64).reshape(-1),
@@ -704,7 +692,7 @@ def _interp_cubic_scattered(
         )
 
     if sample_points.shape[0] == 0:
-        return torch.zeros(query_points.shape[0], device=device, dtype=complex_dtype)
+        return torch.zeros(query_points.shape[0], device=device, dtype=torch.complex64)
 
     sample_extent = sample_points.max(dim=0).values - sample_points.min(dim=0).values
     diagonal = torch.linalg.vector_norm(sample_extent)
@@ -717,7 +705,7 @@ def _interp_cubic_scattered(
         & (query_points[:, 1] <= sample_points[:, 1].max())
     )
 
-    output = torch.zeros(query_points.shape[0], device=device, dtype=complex_dtype)
+    output = torch.zeros(query_points.shape[0], device=device, dtype=torch.complex64)
     values_real = values.real.to(dtype=torch.float64)
     values_imag = values.imag.to(dtype=torch.float64)
     log_cutoff = math.log(torch.finfo(torch.float64).tiny)
@@ -734,9 +722,9 @@ def _interp_cubic_scattered(
         if torch.any(valid):
             numer_real = weights[valid] @ values_real
             numer_imag = weights[valid] @ values_imag
-            output_chunk = torch.zeros(stop - start, device=device, dtype=complex_dtype)
+            output_chunk = torch.zeros(stop - start, device=device, dtype=torch.complex64)
             output_chunk[valid] = torch.complex(numer_real / denom[valid], numer_imag / denom[valid]).to(
-                dtype=complex_dtype
+                dtype=torch.complex64
             )
             output[start:stop] = output_chunk
 
@@ -815,7 +803,7 @@ class DBOperator(_BaseLinearOperator):
         super().__init__(fundfft=self.fundfft, tr=self.tr, rind=self.rind, nind=self.nind, h=self.h)
 
 
-def _torch_gmres(
+def gmres(
     operator: DBOperator,
     rhs: torch.Tensor,
     *,
@@ -980,9 +968,9 @@ def estimate_nd_map(
             f"currents and voltages must have the same shape, got {tuple(currents.shape)} and {tuple(voltages.shape)}."
         )
 
-    complex_dtype = _complex_dtype_from(torch.promote_types(currents.dtype, voltages.dtype))
-    currents = currents.to(dtype=complex_dtype)
-    voltages = voltages.to(dtype=complex_dtype)
+    
+    currents = currents.to(dtype=torch.complex64)
+    voltages = voltages.to(dtype=torch.complex64)
 
     gram = currents @ currents.conj().transpose(-1, -2)
     cross = voltages @ currents.conj().transpose(-1, -2)
@@ -998,8 +986,8 @@ def nd_to_dn_map(
     rcond: float | None = None,
 ) -> torch.Tensor:
     nd_map, squeeze = _as_batch_square_matrix(nd_map, "nd_map")
-    complex_dtype = _complex_dtype_from(nd_map.dtype)
-    nd_map = nd_map.to(dtype=complex_dtype)
+    
+    nd_map = nd_map.to(dtype=torch.complex64)
 
     n = nd_map.shape[-1]
     projector = make_mean_free_projector(n, device=nd_map.device, dtype=nd_map.dtype).expand(nd_map.shape[0], -1, -1)
@@ -1047,7 +1035,6 @@ class DbarReconstruction2D(nn.Module):
         z_chunk_size: int = 1024,
         eps: float = 1e-6,
         background_conductivity: float = 1.0,
-        domain_shape: str = "circle",
         domain_size: float | tuple[float, float] = 2.0,
         inverse_method: str = "born",
         gmres_restart: int = 50,
@@ -1055,16 +1042,11 @@ class DbarReconstruction2D(nn.Module):
         gmres_maxiter: int = 500,
     ) -> None:
         super().__init__()
-        domain_shape = domain_shape.lower()
-        if domain_shape not in {"circle", "square"}:
-            raise ValueError(f"domain_shape must be 'circle' or 'square', got {domain_shape}.")
         inverse_method = inverse_method.lower()
         if inverse_method not in {"born", "dbar"}:
             raise ValueError(
                 f"inverse_method must be 'born' or 'dbar', got {inverse_method}."
             )
-        if inverse_method == "dbar" and domain_shape != "square":
-            raise ValueError("inverse_method='dbar' is currently supported only for domain_shape='square'.")
         if gmres_restart < 1:
             raise ValueError(f"gmres_restart must be positive, got {gmres_restart}.")
         if gmres_rtol <= 0:
@@ -1089,42 +1071,30 @@ class DbarReconstruction2D(nn.Module):
         self.z_chunk_size = z_chunk_size
         self.eps = eps
         self.background_conductivity = background_conductivity  # retained for API compatibility
-        self.domain_shape = domain_shape
         self.domain_size = domain_size
         self.inverse_method = inverse_method
         self.gmres_restart = gmres_restart
         self.gmres_rtol = gmres_rtol
         self.gmres_maxiter = gmres_maxiter
 
-        if self.domain_shape == "square":
-            if self.n_electrodes % 2 != 0:
-                raise ValueError("Square-domain D-bar requires an even number of electrodes.")
-            if self.n_modes != self.n_electrodes - 1:
-                raise ValueError(
-                    f"For domain_shape='square', expected n_modes == n_electrodes - 1, got {self.n_modes} and {self.n_electrodes}."
-                )
-            theta, boundary_weight, _ = arc_length_params_square(
-                self.n_electrodes,
-                domain_size=domain_size,
-                n_boundary_samples=n_boundary_nodes,
+        if self.n_electrodes % 2 != 0:
+            raise ValueError("Square-domain D-bar requires an even number of electrodes.")
+        if self.n_modes != self.n_electrodes - 1:
+            raise ValueError(
+                f"For square domain, expected n_modes == n_electrodes - 1, got {self.n_modes} and {self.n_electrodes}."
             )
-            boundary_points = boundary_points_from_angles(theta, domain_size=domain_size)
-            trig_mode_indices = make_trig_mode_indices(self.n_electrodes)
-            lambda_ref = torch.zeros((self.n_modes, self.n_modes), dtype=torch.float32)
-        else:
-            boundary_weight = 2.0 * math.pi / float(n_boundary_nodes)
-            _, _, theta = make_trig_basis(n_boundary_nodes, n_modes)
-            boundary_points = torch.polar(torch.ones_like(theta), theta)
-            trig_mode_indices = torch.empty(0, dtype=torch.int64)
-            lambda_ref = make_reference_dn_map(n_boundary_nodes=n_boundary_nodes, n_modes=n_modes)
+        theta, boundary_weight, _ = arc_length_params_square(
+            self.n_electrodes,
+            domain_size=domain_size,
+            n_boundary_samples=n_boundary_nodes,
+        )
+        boundary_points = boundary_points_from_angles(theta, domain_size=domain_size)
+        trig_mode_indices = make_trig_mode_indices(self.n_electrodes)
+        lambda_ref = torch.zeros((self.n_modes, self.n_modes), dtype=torch.float32)
 
-        if self.domain_shape == "square":
-            Lx, Ly = get_domain_size(domain_size)
-            x_coords = torch.linspace(0.0, Lx, image_size)
-            y_coords = torch.linspace(0.0, Ly, image_size)
-        else:
-            x_coords = torch.linspace(-1.0, 1.0, image_size)
-            y_coords = x_coords
+        Lx, Ly = get_domain_size(domain_size)
+        x_coords = torch.linspace(0.0, Lx, image_size)
+        y_coords = torch.linspace(0.0, Ly, image_size)
 
         # matching forward_solver's grid
         xx, yy = torch.meshgrid(x_coords, y_coords, indexing="ij")
@@ -1150,12 +1120,12 @@ class DbarReconstruction2D(nn.Module):
 
     def extra_repr(self) -> str:
         return (
-            f"domain_shape={self.domain_shape}, inverse_method={self.inverse_method}, image_size={self.image_size}, "
+            f"inverse_method={self.inverse_method}, image_size={self.image_size}, "
             f"n_boundary_nodes={self.n_boundary_nodes}, n_modes={self.n_modes}, domain_size={self.domain_size}, "
             f"k_grid_size={self.k_grid_size}, k_radius={self.k_radius}, k_extent={self.k_extent}"
         )
 
-    def compute_scattering_transform_square(
+    def compute_scattering_transform(
         self,
         lambda_sigma: torch.Tensor,
         lambda_ref: torch.Tensor,
@@ -1170,9 +1140,9 @@ class DbarReconstruction2D(nn.Module):
                 f"Expected lambda_ref with shape (*, {expected_shape[0]}, {expected_shape[1]}), got {tuple(lambda_ref.shape)}."
             )
 
-        complex_dtype = _complex_dtype_from(torch.promote_types(lambda_sigma.dtype, lambda_ref.dtype))
+        
         k_mask = self.k_mask.reshape(-1)
-        kvec = self.k_grid.reshape(-1)[k_mask].to(dtype=complex_dtype)
+        kvec = self.k_grid.reshape(-1)[k_mask].to(dtype=torch.complex64)
         theta_arc = self.theta.to(dtype=self.boundary_points.real.dtype)
         Dtheta = float(self.boundary_weight.item())
         Fpsi_BIE = compute_psi_BIE_square(
@@ -1181,11 +1151,11 @@ class DbarReconstruction2D(nn.Module):
             self.trig_mode_indices,
             domain_size=self.domain_size,
             Dtheta=Dtheta,
-        ).to(device=self.k_grid.device, dtype=complex_dtype)
+        ).to(device=self.k_grid.device, dtype=torch.complex64)
 
         out = torch.zeros(
             (lambda_sigma.shape[0], self.k_grid_size, self.k_grid_size),
-            dtype=complex_dtype,
+            dtype=torch.complex64,
             device=self.k_grid.device,
         )
         for batch_idx in range(lambda_sigma.shape[0]):
@@ -1198,33 +1168,11 @@ class DbarReconstruction2D(nn.Module):
                 domain_size=self.domain_size,
                 trig_mode_indices=self.trig_mode_indices,
                 Dtheta=Dtheta,
-            ).to(dtype=complex_dtype, device=self.k_grid.device)
-            flat = torch.zeros(self.k_grid.numel(), dtype=complex_dtype, device=self.k_grid.device)
+            ).to(dtype=torch.complex64, device=self.k_grid.device)
+            flat = torch.zeros(self.k_grid.numel(), dtype=torch.complex64, device=self.k_grid.device)
             flat[k_mask] = self.scattering_scale * tbie
             out[batch_idx] = flat.reshape(self.k_grid_size, self.k_grid_size)
         return out
-
-    def compute_scattering_transform(self, delta_lambda: torch.Tensor) -> torch.Tensor:
-        if delta_lambda.shape[-2:] != (self.n_boundary_nodes, self.n_boundary_nodes):
-            raise ValueError(
-                f"Expected delta_lambda with shape (*, {self.n_boundary_nodes}, {self.n_boundary_nodes}), "
-                f"got {tuple(delta_lambda.shape)}."
-            )
-
-        k = self.k_grid.reshape(-1)
-        boundary = self.boundary_points.to(dtype=delta_lambda.dtype)
-
-        psi_in = torch.exp(1j * (k[:, None] * boundary[None, :]))
-        psi_out = torch.exp(1j * (k.conj()[:, None] * boundary.conj()[None, :]))
-
-        psi_in = psi_in - psi_in.mean(dim=1, keepdim=True)
-        psi_out = psi_out - psi_out.mean(dim=1, keepdim=True)
-
-        delta_psi = torch.einsum("bij,kj->bik", delta_lambda, psi_in)
-        t_exp = self.boundary_weight * torch.einsum("ki,bik->bk", psi_out.conj(), delta_psi)
-        t_exp = self.scattering_scale * t_exp
-        t_exp = t_exp * self.k_mask.reshape(1, -1).to(dtype=t_exp.real.dtype)
-        return t_exp.reshape(delta_lambda.shape[0], self.k_grid_size, self.k_grid_size)
 
     def interpolate_precomputed_scattering(
         self,
@@ -1248,12 +1196,12 @@ class DbarReconstruction2D(nn.Module):
 
         grid_shape = (int(K1.shape[0]), int(K1.shape[1])) if K1 is not None else None
         tBIE, squeeze = _as_batch_scattering_samples(tBIE, "tBIE", grid_shape=grid_shape)
-        complex_dtype = _complex_dtype_from(tBIE.dtype)
+        
         device = self.k_grid.device
         out = torch.zeros(
             (tBIE.shape[0], self.k_grid_size, self.k_grid_size),
             device=device,
-            dtype=complex_dtype,
+            dtype=torch.complex64,
         )
 
         query_mask = self.k_mask.reshape(-1)
@@ -1265,14 +1213,14 @@ class DbarReconstruction2D(nn.Module):
         Kvec_t = None if Kvec is None else torch.as_tensor(Kvec, device=device)
 
         for b in range(tBIE.shape[0]):
-            sample = tBIE[b].to(device=device, dtype=complex_dtype)
+            sample = tBIE[b].to(device=device, dtype=torch.complex64)
 
             if K1_t is not None:
                 assert K2_t is not None
                 if sample.ndim == 1:
                     if t_max is None:
                         raise ValueError("t_max is required when tBIE is provided as vector samples.")
-                    scat_grid = torch.zeros_like(K1_t, dtype=complex_dtype)
+                    scat_grid = torch.zeros_like(K1_t, dtype=torch.complex64)
                     inside = torch.abs(K1_t.to(dtype=torch.float64) + 1j * K2_t.to(dtype=torch.float64)) < float(t_max)
                     if sample.numel() != int(inside.sum().item()):
                         raise ValueError(
@@ -1296,7 +1244,7 @@ class DbarReconstruction2D(nn.Module):
                     sample[torch.abs(torch.imag(sample)) > cutoff] = 0
                 interp_vals = _interp_cubic_scattered(Kvec_t, sample, query_x, query_y)
 
-            flat = torch.zeros(self.k_grid.numel(), device=device, dtype=complex_dtype)
+            flat = torch.zeros(self.k_grid.numel(), device=device, dtype=torch.complex64)
             flat[query_mask] = interp_vals
             out[b] = flat.reshape(self.k_grid_size, self.k_grid_size)
 
@@ -1350,14 +1298,10 @@ class DbarReconstruction2D(nn.Module):
             "scattering_transform",
             self.k_grid_size,
         )
-        if self.domain_shape != "square":
-            raise ValueError("inverse_method='dbar' is currently supported only for domain_shape='square'.")
 
-        complex_dtype = _complex_dtype_from(scattering_transform.dtype)
         device = scattering_transform.device
-        real_dtype = torch.float64 if complex_dtype == torch.complex128 else torch.float32
 
-        k_grid = self.k_grid.to(device=device, dtype=complex_dtype)
+        k_grid = self.k_grid.to(device=device, dtype=torch.complex64)
         rind = self.k_mask.to(device=device, dtype=torch.bool)
         nind = int(rind.sum().item())
         if nind == 0:
@@ -1390,11 +1334,11 @@ class DbarReconstruction2D(nn.Module):
         fundfft = torch.fft.fft2(torch.fft.fftshift(fund, dim=(-2, -1)), dim=(-2, -1))
         rhs = torch.cat(
             (
-                torch.ones(nind, device=device, dtype=real_dtype),
-                torch.zeros(nind, device=device, dtype=real_dtype),
+                torch.ones(nind, device=device, dtype=torch.float32),
+                torch.zeros(nind, device=device, dtype=torch.float32),
             )
         )
-        z_flat = self.z_grid.to(device=device, dtype=complex_dtype).reshape(-1)
+        z_flat = self.z_grid.to(device=device, dtype=torch.complex64).reshape(-1)
         recon = torch.empty(
             (scattering_transform.shape[0], z_flat.numel()),
             device=device,
@@ -1405,9 +1349,9 @@ class DbarReconstruction2D(nn.Module):
         k_rind = k_grid[rind]
         zero_idx = int(torch.argmin(torch.abs(k_rind)).item())
         for batch_idx in range(scattering_transform.shape[0]):
-            scatk = scattering_transform[batch_idx].to(device=device, dtype=complex_dtype) * scatk_scale
+            scatk = scattering_transform[batch_idx].to(device=device, dtype=torch.complex64) * scatk_scale
             scatk[ind0] = 0.0
-            iniguess = rhs.clone()
+            init_guess = rhs.clone()
             for z_idx, z in enumerate(z_flat):
                 tr = (1.0 / (4.0 * math.pi)) * scatk * torch.exp(
                     -1j * (k_grid * z + torch.conj(k_grid * z))
@@ -1419,10 +1363,10 @@ class DbarReconstruction2D(nn.Module):
                     nind=nind,
                     h=self_h,
                 )
-                solution, info = _torch_gmres(
+                solution, info = gmres(
                     operator,
                     rhs,
-                    x0=iniguess,
+                    x0=init_guess,
                     restart=self.gmres_restart,
                     rtol=self.gmres_rtol,
                     atol=0.0,
@@ -1432,7 +1376,7 @@ class DbarReconstruction2D(nn.Module):
                     raise RuntimeError(
                         f"GMRES failed for batch {batch_idx} at spatial index {z_idx} with info={info}."
                     )
-                iniguess = solution
+                init_guess = solution
                 mu_rind = torch.complex(solution[:nind], solution[nind:])
                 recon[batch_idx, z_idx] = mu_rind[zero_idx].abs().square().to(dtype=recon.dtype)
 
@@ -1460,18 +1404,16 @@ class DbarReconstruction2D(nn.Module):
             Square Cartesian image with shape (1, H, W) or (B, 1, H, W).
         """
         lambda_sigma, squeeze = _as_batch_square_matrix(lambda_sigma, "lambda_sigma")
-        complex_dtype = _complex_dtype_from(lambda_sigma.dtype)
+        
         device = self.z_grid.device
 
-        lambda_sigma = lambda_sigma.to(device=device, dtype=complex_dtype)
+        lambda_sigma = lambda_sigma.to(device=device, dtype=torch.complex64)
 
         if lambda_ref is None:
-            if self.domain_shape == "square":
-                raise ValueError("Square-domain D-bar reconstruction requires an explicit reference DN map.")
-            lambda_ref_batch = self.lambda_ref.to(device=device, dtype=complex_dtype).unsqueeze(0)
+            raise ValueError("Square-domain D-bar reconstruction requires an explicit reference DN map.")
         else:
             lambda_ref_batch, _ = _as_batch_square_matrix(lambda_ref, "lambda_ref")
-            lambda_ref_batch = lambda_ref_batch.to(device=device, dtype=complex_dtype)
+            lambda_ref_batch = lambda_ref_batch.to(device=device, dtype=torch.complex64)
 
         if lambda_ref_batch.shape[0] == 1 and lambda_sigma.shape[0] > 1:
             lambda_ref_batch = lambda_ref_batch.expand(lambda_sigma.shape[0], -1, -1)
@@ -1480,11 +1422,7 @@ class DbarReconstruction2D(nn.Module):
                 f"lambda_ref batch dimension must be 1 or {lambda_sigma.shape[0]}, got {lambda_ref_batch.shape[0]}."
             )
 
-        if self.domain_shape == "square":
-            t_exp = self.compute_scattering_transform_square(lambda_sigma, lambda_ref_batch)
-        else:
-            delta_lambda = lambda_sigma - lambda_ref_batch
-            t_exp = self.compute_scattering_transform(delta_lambda)
+        t_exp = self.compute_scattering_transform(lambda_sigma, lambda_ref_batch)
         sigma = self.solve_sigma(t_exp)
         return sigma[0] if squeeze else sigma
 
@@ -1497,42 +1435,27 @@ class DbarReconstruction2D(nn.Module):
         reference_voltages: torch.Tensor | None = None,
         regularization: float = 1e-6,
     ) -> torch.Tensor:
-        if self.domain_shape == "square":
-            if reference_voltages is None:
-                raise ValueError("Square-domain D-bar reconstruction requires reference_voltages.")
+        if reference_voltages is None:
+            raise ValueError("Square-domain D-bar reconstruction requires reference_voltages.")
 
-            if reference_currents is None:
-                reference_currents = currents
+        if reference_currents is None:
+            reference_currents = currents
 
-            lambda_sigma = build_dn_map_from_electrode_data(
-                voltages,
-                current_patterns=currents,
-                domain_size=self.domain_size,
-                trig_mode_indices=self.trig_mode_indices,
-                n_boundary_samples=self.n_boundary_nodes,
-                regularization=regularization,
-            )
-            lambda_ref = build_dn_map_from_electrode_data(
-                reference_voltages,
-                current_patterns=reference_currents,
-                domain_size=self.domain_size,
-                trig_mode_indices=self.trig_mode_indices,
-                n_boundary_samples=self.n_boundary_nodes,
-                regularization=regularization,
-            )
-            return self.forward(lambda_sigma=lambda_sigma, lambda_ref=lambda_ref)
-
-        lambda_sigma = estimate_dn_map(currents=currents, voltages=voltages, regularization=regularization)
-
-        lambda_ref = None
-        if reference_voltages is not None:
-            if reference_currents is None:
-                reference_currents = currents
-            lambda_ref = estimate_dn_map(
-                currents=reference_currents,
-                voltages=reference_voltages,
-                regularization=regularization,
-            )
-
+        lambda_sigma = build_dn_map_from_electrode_data(
+            voltages,
+            current_patterns=currents,
+            domain_size=self.domain_size,
+            trig_mode_indices=self.trig_mode_indices,
+            n_boundary_samples=self.n_boundary_nodes,
+            regularization=regularization,
+        )
+        lambda_ref = build_dn_map_from_electrode_data(
+            reference_voltages,
+            current_patterns=reference_currents,
+            domain_size=self.domain_size,
+            trig_mode_indices=self.trig_mode_indices,
+            n_boundary_samples=self.n_boundary_nodes,
+            regularization=regularization,
+        )
         return self.forward(lambda_sigma=lambda_sigma, lambda_ref=lambda_ref)
 

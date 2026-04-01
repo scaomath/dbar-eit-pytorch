@@ -229,14 +229,14 @@ def build_ND_from_kit4(
     u1_trace = np.zeros((Nfii, nBasis))
     for N_idx in range(nBasis):
         nn = 0
-        for iii in range(Nfii):
-            if fii_shift[iii] <= gammaMid_ext[nn]:
-                u_trace[iii, N_idx] = Uel_ext[nn, N_idx]
-                u1_trace[iii, N_idx] = Uel1_ext[nn, N_idx]
+        for ii in range(Nfii):
+            if fii_shift[ii] <= gammaMid_ext[nn]:
+                u_trace[ii, N_idx] = Uel_ext[nn, N_idx]
+                u1_trace[ii, N_idx] = Uel1_ext[nn, N_idx]
             else:
                 nn += 1
-                u_trace[iii, N_idx] = Uel_ext[nn, N_idx]
-                u1_trace[iii, N_idx] = Uel1_ext[nn, N_idx]
+                u_trace[ii, N_idx] = Uel_ext[nn, N_idx]
+                u1_trace[ii, N_idx] = Uel1_ext[nn, N_idx]
         u_trace[:, N_idx] -= u_trace[:, N_idx].mean()
         u1_trace[:, N_idx] -= u1_trace[:, N_idx].mean()
 
@@ -447,22 +447,26 @@ def Dbar_solve(
     rhs = np.concatenate(
         (np.ones(Nind, dtype=np.float64), np.zeros(Nind, dtype=np.float64))
     )
-    iniguess = rhs.copy()
+    init_guess = rhs.copy()
 
     recon = np.ones(zvec.shape[0], dtype=np.complex128)
 
+
+    # For each node z (points of reconstruction), solve a separate D-bar equation in k with a z-dependent right-hand side 
+    # then compute mu(z,0) and store recon(z)=mu(z,0)^2.
+    # MATLAB original code uses a for-loop (line 91--99 comp06_Dbarsolve.m)
     for iii, z in enumerate(tqdm(zvec, total=zvec.size, desc="D-bar solve"), start=1):
         TR = (1.0 / (4.0 * np.pi)) * scatk * np.exp(-1j * (k * z + np.conj(k * z)))
         A = DBarOperator(fundfft=fundfft, TR=TR, Rind=Rind, Nind=Nind, h=h)
 
         w, info = gmres(
-            A, rhs, x0=iniguess, restart=restart, rtol=rtol, atol=0.0, maxiter=maxiter
+            A, rhs, x0=init_guess, restart=restart, rtol=rtol, atol=0.0, maxiter=maxiter
         )
         if info != 0:
             raise RuntimeError(
                 f"GMRES failed at node {iii}/{zvec.size} with info={info}."
             )
-
+        init_guess = w.copy()  # warm start for next solve (changed from MATLAB)
         mu = np.zeros_like(k, dtype=np.complex128)
         mu[Rind] = w[:Nind] + 1j * w[Nind:]
         recon[iii - 1] = mu[ind0][0] ** 2
@@ -476,7 +480,7 @@ def plot_reconstruction(p: np.ndarray, recon: np.ndarray, data_dir: Path):
     t = np.asarray(mesh["t"])
     triangles = np.asarray(t[:3, :].T - 1, dtype=np.int32)
     ref_recon = np.asarray(ref_mat["recon"], dtype=np.float64).ravel()
-    py_recon = np.asarray(recon, dtype=np.float64).ravel()
+    py_recon = recon.ravel()
 
     vmin = float(min(py_recon.min(), ref_recon.min()))
     vmax = float(max(py_recon.max(), ref_recon.max()))
