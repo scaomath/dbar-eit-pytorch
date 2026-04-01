@@ -65,25 +65,32 @@ def centered_convolution(
     return (h**2) * ifftshift(ifft2(fundfft * fft2(fftshift(values))))
 
 
-def db_oper_real(
-    w_vec: np.ndarray,
-    *,
-    fundfft: np.ndarray,
-    TR: np.ndarray,
-    Rind: np.ndarray,
-    Nind: int,
-    h: float,
-) -> np.ndarray:
-    """DB_oper in the MATLAB routine."""
-    w = np.zeros(TR.shape, dtype=np.complex128)
-    w[Rind] = w_vec[:Nind] + 1j * w_vec[Nind:]
-    conv = centered_convolution(fundfft, TR * np.conj(w), h)
-    out = w - conv
-    return np.concatenate((np.real(out[Rind]), np.imag(out[Rind])))
+class DBarOperator(LinearOperator):
+    def __init__(
+        self,
+        *,
+        fundfft: np.ndarray,
+        TR: np.ndarray,
+        Rind: np.ndarray,
+        Nind: int,
+        h: float,
+    ):
+        self.fundfft = fundfft
+        self.truncation = TR
+        self.Rind = Rind
+        self.Nind = Nind
+        self.h = h
+        super().__init__(dtype=np.float64, shape=(2 * Nind, 2 * Nind))
+
+    def _matvec(self, v: np.ndarray) -> np.ndarray:
+        w = np.zeros(self.truncation.shape, dtype=np.complex128)
+        w[self.Rind] = v[: self.Nind] + 1j * v[self.Nind :]
+        conv = centered_convolution(self.fundfft, self.truncation * np.conj(w), self.h)
+        out = w - conv
+        return np.concatenate((np.real(out[self.Rind]), np.imag(out[self.Rind])))
 
 
 #  ex2Kvec_comp.m 
-
 
 def build_kvec_grid(
     R: float = R_freq, h: float = h_freq
@@ -325,8 +332,8 @@ def build_dbar_inputs_from_kit4_data(
     psi_dat = loadmat(data_dir / "psi_BIE.mat")
     meas_dat = loadmat(kit4_dir / f"dataMat_adj_{ex}_{ver}.mat")
 
-    p = np.asarray(mesh_dat["p"], dtype=np.float64)
-    zvec = p[0, :].astype(np.complex128) + 1j * p[1, :].astype(np.complex128)
+    p = np.asarray(mesh_dat["p"], dtype=np.float64) # (2, num_nodes) array of node coordinates (x; y)
+    zvec = p[0, :].astype(np.complex128) + 1j * p[1, :].astype(np.complex128) # z_vector in the D-bar paper, (num_nodes,) complex array of node locations
 
     Ntrig = elec_dat["Ntrig"].ravel().astype(int)
     fii = ang_dat["fii"].ravel().astype(np.float64)
@@ -363,7 +370,9 @@ def build_dbar_inputs_from_kit4_data(
             f"tBIE length {tBIE.size} does not match |K|<tMAX count {int(inside_tmax.sum())}."
         )
     scatBIE_34 = np.zeros_like(K1, dtype=np.complex128)
-    scatBIE_34[inside_tmax] = tBIE  # row-major fill; Kvec is column-major ordered
+    scatBIE_34_flat = scatBIE_34.reshape(-1, order="F")
+    scatBIE_34_flat[inside_tmax.reshape(-1, order="F")] = tBIE
+    scatBIE_34 = scatBIE_34_flat.reshape(K1.shape, order="F")
     scatBIE_34[np.abs(np.real(scatBIE_34)) > cutoff] = 0
     scatBIE_34[np.abs(np.imag(scatBIE_34)) > cutoff] = 0
 
@@ -419,7 +428,7 @@ def Dbar_solve(
         raise ValueError("Origin not found on computational k-grid.")
     ktmp[ind0] = 1.0
 
-    scatk = scat / np.conj(ktmp)
+    scatk = scat / np.conj(ktmp) # scattering transform divided by conj(k)
     scatk[ind0] = 0.0
 
     fund = 1.0 / (np.pi * ktmp)
@@ -442,24 +451,9 @@ def Dbar_solve(
 
     recon = np.ones(zvec.shape[0], dtype=np.complex128)
 
-    class _DBOperator(LinearOperator):
-        def __init__(self, TR: np.ndarray):
-            self._TR = TR
-            super().__init__(dtype=np.float64, shape=(2 * Nind, 2 * Nind))
-
-        def _matvec(self, v: np.ndarray) -> np.ndarray:
-            return db_oper_real(
-                v,
-                fundfft=fundfft,
-                TR=self._TR,
-                Rind=Rind,
-                Nind=Nind,
-                h=h,
-            )
-
     for iii, z in enumerate(tqdm(zvec, total=zvec.size, desc="D-bar solve"), start=1):
         TR = (1.0 / (4.0 * np.pi)) * scatk * np.exp(-1j * (k * z + np.conj(k * z)))
-        A = _DBOperator(TR)
+        A = DBarOperator(fundfft=fundfft, TR=TR, Rind=Rind, Nind=Nind, h=h)
 
         w, info = gmres(
             A, rhs, x0=iniguess, restart=restart, rtol=rtol, atol=0.0, maxiter=maxiter
