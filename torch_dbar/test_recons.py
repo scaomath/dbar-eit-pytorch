@@ -37,7 +37,6 @@ class TestReconstructionVerification(absltest.TestCase):
             n_electrodes=8,
             k_grid_size=9,
             k_radius=2.0,
-            domain_shape="square",
             domain_size=2.0,
         )
 
@@ -125,7 +124,6 @@ class TestReconstructionVerification(absltest.TestCase):
             n_electrodes=8,
             k_grid_size=32,
             k_radius=4.0,
-            domain_shape="square",
             domain_size=2.0,
         )
         sigma_rec = recon.forward(lambda_sigma=dn_target, lambda_ref=dn_ref)[0]
