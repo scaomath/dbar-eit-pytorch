@@ -204,4 +204,10 @@ cython_debug/
 # Marimo
 marimo/_static/
 marimo/_lsp/
-__marimo__/
+__marimo__
+
+# data
+KIT4_measdata/*.mat
+data/*.mat
+examples/*.jpeg
+examples/eda_outputs/*
