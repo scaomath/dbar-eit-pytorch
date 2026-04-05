@@ -5,8 +5,8 @@ from dbar import (
     DbarReconstruction2D,
     arc_length_params_square,
     build_dn_map_from_electrode_data,
-    compute_psi_BIE_square,
-    compute_tBIE_square,
+    compute_psi_BIE,
+    compute_tBIE,
     make_trig_mode_indices,
 )
 from cem_solver import CompleteElectrodeModel, generate_adjacent_current_patterns
@@ -70,7 +70,7 @@ class TestReconstructionVerification(absltest.TestCase):
         theta_arc, Dtheta, _ = arc_length_params_square(8, domain_size=2.0, n_boundary_samples=128)
         trig_mode_indices = make_trig_mode_indices(8)
         kvec = torch.tensor([0.25 + 0.0j, 0.5 + 0.0j, 1.0 + 0.0j, 2.0 + 0.0j, 4.0 + 0.0j], dtype=torch.complex128)
-        fpsi = compute_psi_BIE_square(
+        fpsi = compute_psi_BIE(
             kvec,
             theta_arc,
             trig_mode_indices,
@@ -78,7 +78,7 @@ class TestReconstructionVerification(absltest.TestCase):
             Dtheta=Dtheta,
         )
 
-        t_ref = compute_tBIE_square(
+        t_ref = compute_tBIE(
             Kvec=kvec,
             DN=dn_ref,
             DN1=dn_ref,
@@ -90,7 +90,7 @@ class TestReconstructionVerification(absltest.TestCase):
         )
         torch.testing.assert_close(t_ref, torch.zeros_like(t_ref), atol=1e-10, rtol=0.0)
 
-        t_smooth = compute_tBIE_square(
+        t_smooth = compute_tBIE(
             Kvec=kvec,
             DN=dn_smooth,
             DN1=dn_ref,

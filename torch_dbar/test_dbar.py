@@ -6,9 +6,11 @@ from dbar import (
     arc_length_params_square,
     build_dn_map_from_electrode_data,
     build_nd_map_from_electrode_data,
+    boundary_points_from_arclength,
     boundary_points_from_angles,
-    compute_psi_BIE_square,
-    compute_tBIE_square,
+    compute_psi_BIE,
+    compute_tBIE,
+    square_harmonic_current_basis,
     make_square_harmonic_trace_basis,
     make_trig_mode_indices,
     trig_boundary_matrix,
@@ -62,21 +64,23 @@ class TestDbarBoundary(parameterized.TestCase):
 
     def test_arc_length_params_square(self):
         fii, Dfii, gamma_mid = arc_length_params_square(8, domain_size=2.0, n_boundary_samples=16)
+        expected_fii = torch.arange(0.0, 8.0, 0.5, dtype=torch.float64)
         expected_gamma = torch.tensor(
             [
-                math.pi / 8.0,
-                3.0 * math.pi / 8.0,
-                5.0 * math.pi / 8.0,
-                7.0 * math.pi / 8.0,
-                9.0 * math.pi / 8.0,
-                11.0 * math.pi / 8.0,
-                13.0 * math.pi / 8.0,
-                15.0 * math.pi / 8.0,
+                0.5,
+                1.5,
+                2.5,
+                3.5,
+                4.5,
+                5.5,
+                6.5,
+                7.5,
             ],
             dtype=torch.float64,
         )
         self.assertLen(fii, 16)
-        self.assertAlmostEqual(Dfii, 2.0 * math.pi / 16.0)
+        torch.testing.assert_close(fii, expected_fii)
+        self.assertAlmostEqual(Dfii, 8.0 / 16.0)
         torch.testing.assert_close(gamma_mid, expected_gamma)
 
     @parameterized.named_parameters(
@@ -163,7 +167,7 @@ class TestDbarCGO(absltest.TestCase):
     def test_compute_psi_BIE_square_zero_k(self):
         theta_arc, Dtheta, _ = arc_length_params_square(8, domain_size=2.0, n_boundary_samples=128)
         ntrig = make_trig_mode_indices(8)
-        fpsi = compute_psi_BIE_square(
+        fpsi = compute_psi_BIE(
             torch.tensor([0.0 + 0.0j], dtype=torch.complex128),
             theta_arc,
             ntrig,
@@ -184,8 +188,8 @@ class TestDbarCGO(absltest.TestCase):
         theta_arc, Dtheta, _ = arc_length_params_square(8, domain_size=2.0, n_boundary_samples=128)
         ntrig = make_trig_mode_indices(8)
         kvec = torch.tensor([0.0 + 0.0j, 0.25 + 0.5j, -0.4 + 0.1j], dtype=torch.complex128)
-        fpsi = compute_psi_BIE_square(kvec, theta_arc, ntrig, domain_size=2.0, Dtheta=Dtheta)
-        tbie = compute_tBIE_square(
+        fpsi = compute_psi_BIE(kvec, theta_arc, ntrig, domain_size=2.0, Dtheta=Dtheta)
+        tbie = compute_tBIE(
             Kvec=kvec,
             DN=dn_map,
             DN1=dn_map,
@@ -199,10 +203,15 @@ class TestDbarCGO(absltest.TestCase):
 
 
 class TestSquareBoundaryBases(absltest.TestCase):
+    def test_square_harmonic_current_basis_uses_boundary_arclength(self):
+        _, square_basis = square_harmonic_current_basis(8, domain_size=2.0, n_x_modes=1, n_y_modes=1)
+        expected_first_mode = torch.tensor([0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=square_basis.dtype)
+        torch.testing.assert_close(square_basis[:, 0], expected_first_mode, atol=1e-12, rtol=0.0)
+
     def test_square_harmonic_trace_basis_matches_analytic_bottom_trace(self):
         theta_arc, _, _ = arc_length_params_square(8, domain_size=2.0, n_boundary_samples=256)
         basis = make_square_harmonic_trace_basis(theta_arc, 1, domain_size=2.0)
-        boundary_points = boundary_points_from_angles(theta_arc, domain_size=2.0)
+        boundary_points = boundary_points_from_arclength(theta_arc, domain_size=2.0)
 
         lam = math.pi / 2.0
         analytic = torch.sin(lam * boundary_points.real) * torch.sinh(lam * (2.0 - boundary_points.imag)) / math.sinh(2.0 * lam)
@@ -211,7 +220,7 @@ class TestSquareBoundaryBases(absltest.TestCase):
     def test_square_harmonic_trace_basis_localizes_each_side(self):
         theta_arc, _, _ = arc_length_params_square(8, domain_size=2.0, n_boundary_samples=256)
         basis = make_square_harmonic_trace_basis(theta_arc, 1, domain_size=2.0)
-        boundary_points = boundary_points_from_angles(theta_arc, domain_size=2.0)
+        boundary_points = boundary_points_from_arclength(theta_arc, domain_size=2.0)
         x_coord = boundary_points.real
         y_coord = boundary_points.imag
 
@@ -232,7 +241,7 @@ class TestSquareBoundaryBases(absltest.TestCase):
         square_residual = torch.linalg.vector_norm(square_basis @ square_solution - target_trace) / torch.linalg.vector_norm(target_trace)
 
         trig_modes = make_trig_mode_indices(8)
-        trig_basis = trig_boundary_matrix(trig_modes, theta_arc).transpose(0, 1)
+        trig_basis = trig_boundary_matrix(trig_modes, theta_arc, domain_size=2.0).transpose(0, 1)
         trig_solution = torch.linalg.lstsq(trig_basis, target_trace.unsqueeze(-1)).solution.squeeze(-1)
         trig_residual = torch.linalg.vector_norm(trig_basis @ trig_solution - target_trace) / torch.linalg.vector_norm(target_trace)
 
