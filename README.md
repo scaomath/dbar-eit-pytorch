@@ -12,30 +12,41 @@ You need to download the `KIT4_Dbar_recon.zip` data file from the official MATLA
 ## Notes
 
 For the classical circular-domain D-bar method on the unit disk, the boundary is parameterized by an angle
+
 $$
 z(\theta) = e^{i\theta}, \qquad \theta \in [0,2\pi),  ds = d\theta.
 $$
+
 and since the radius is usually normalized to $1$.
 In the circular-domain setting, the usual trigonometric boundary basis is
+
 $$
 \phi_n^{\cos}(\theta) = \frac{1}{\sqrt{\pi}}\cos(n\theta),
 \qquad
 \phi_n^{\sin}(\theta) = \frac{1}{\sqrt{\pi}}\sin(n\theta),
 $$
+
 so boundary projections and scattering quantities are written as angle integrals, for example
+
 $$
 F_\psi(k) = \int_0^{2\pi} \phi(\theta) e^{ik z(\theta)} \, d\theta,
 $$
+
 and
+
 $$
 t^{exp}(k) = \int_0^{2\pi} e^{i\bar{k}\overline{z(\theta)}} (\Lambda_\sigma - \Lambda_1)\psi^{exp}(z(\theta),k) \, d\theta,
 $$
+
 where $\Lambda_\sigma$ is the usual NtD map and $\Lambda_1$ is the NtD map with no inclusion.
 For the square-domain port, the boundary is not naturally parameterized by the polar angle, the implementation uses arclength.
+
 $$
 s \in [0, |\partial\Omega|), \qquad |\partial\Omega| = 2(L_x + L_y),
 $$
+
 with piecewise square-boundary parameterization
+
 $$
 z(s) =
 \begin{cases}
@@ -45,6 +56,7 @@ x + iL_y, & s=2L_x+L_y-x, \quad 0 \le x < L_x,\\
 0 + iy, & s=|\partial\Omega|-y, \quad 0 \le y < L_y.
 \end{cases}
 $$
+
 On each side of the square, $ds = \pm dx$, $ds = \pm dy$, $d\theta$.
 
 ## References
